@@ -1,0 +1,16 @@
+# Build files
+build/
+*.o
+*.elf
+*.bin
+
+# ESP-IDF
+sdkconfig.old
+managed_components/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
