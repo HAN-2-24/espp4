@@ -1,12 +1,23 @@
 # Build files
 build/
+build_*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
 *.o
+*.obj
 *.elf
 *.bin
+*.map
+*.hex
+*.lst
 
 # ESP-IDF
 sdkconfig.old
 managed_components/
+*.pyc
+__pycache__/
 
 # IDE
 .vscode/
@@ -14,3 +25,8 @@ managed_components/
 
 # Logs
 *.log
+
+# Local archives / backups
+*.rar
+*.zip
+*.7z

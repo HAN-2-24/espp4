@@ -85,25 +85,21 @@ extern "C" void app_main(void)
     assert(smart_gadget != nullptr && "Failed to create phone app squareline");
     assert((phone->installApp(smart_gadget) >= 0) && "Failed to install phone app squareline");
 
-    Calculator *calculator = new Calculator();
-    assert(calculator != nullptr && "Failed to create calculator");
-    assert((phone->installApp(calculator) >= 0) && "Failed to begin calculator");
 
-    MusicPlayer *music_player = new MusicPlayer();
-    assert(music_player != nullptr && "Failed to create music_player");
-    assert((phone->installApp(music_player) >= 0) && "Failed to begin music_player");
 
     AppSettings *app_settings = new AppSettings();
     assert(app_settings != nullptr && "Failed to create app_settings");
     assert((phone->installApp(app_settings) >= 0) && "Failed to begin app_settings");
 
-    Game2048 *game_2048 = new Game2048();
-    assert(game_2048 != nullptr && "Failed to create game_2048");
-    assert((phone->installApp(game_2048) >= 0) && "Failed to begin game_2048");
+    HelmetDashboard *helmet_dashboard = new HelmetDashboard();
+    assert(helmet_dashboard != nullptr && "Failed to create helmet_dashboard");
+    assert((phone->installApp(helmet_dashboard) >= 0) && "Failed to install helmet_dashboard");
 
     Camera *camera = new Camera(1280, 720);
     assert(camera != nullptr && "Failed to create camera");
     assert((phone->installApp(camera) >= 0) && "Failed to begin camera");
+
+
 
 #if CONFIG_EXAMPLE_ENABLE_SD_CARD
     ESP_LOGW(TAG, "Using Video Player example requires inserting the SD card in advance and saving an MJPEG format video on the SD card");

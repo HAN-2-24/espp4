@@ -18,3 +18,4 @@ dependencies:
   espressif/esp_lvgl_adapter:
     version: "0.3.*"
     public: true
+
