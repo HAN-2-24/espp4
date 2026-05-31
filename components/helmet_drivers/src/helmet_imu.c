@@ -17,6 +17,7 @@
 
 #include "helmet_board.h"
 #include "helmet_state.h"
+#include "helmet_voice.h"
 
 static const char *TAG = "helmet_imu";
 
@@ -47,6 +48,9 @@ static const char *TAG = "helmet_imu";
 #define GRAVITY_F                    9.80665f
 
 #define IMU_DEBUG_LOG                1
+
+#define IMU_ACCIDENT_ALARM_COOLDOWN_MS 10000
+#define IMU_ACCIDENT_ALARM_RETRY_MS    1000
 
 #ifndef HELMET_I2C_FREQ_HZ
 #define HELMET_I2C_FREQ_HZ           100000
@@ -712,6 +716,10 @@ static void imu_check_accident(
 
 static esp_err_t imu_read_and_update_once(double dt)
 {
+    static bool alarm_latched = false;
+    static TickType_t last_alarm_tick = 0;
+    static TickType_t last_alarm_attempt_tick = 0;
+
     short ax_raw = 0;
     short ay_raw = 0;
     short az_raw = 0;
@@ -793,6 +801,41 @@ static esp_err_t imu_read_and_update_once(double dt)
         fall_detected,
         impact_detected
     );
+
+    bool accident_detected = fall_detected || impact_detected;
+
+    if (accident_detected && !alarm_latched) {
+        TickType_t now = xTaskGetTickCount();
+        TickType_t cooldown = pdMS_TO_TICKS(IMU_ACCIDENT_ALARM_COOLDOWN_MS);
+        TickType_t retry_interval = pdMS_TO_TICKS(IMU_ACCIDENT_ALARM_RETRY_MS);
+        bool can_attempt = (last_alarm_attempt_tick == 0) ||
+                           ((now - last_alarm_attempt_tick) >= retry_interval);
+        bool cooldown_elapsed = (last_alarm_tick == 0) ||
+                                ((now - last_alarm_tick) >= cooldown);
+
+        if (can_attempt && cooldown_elapsed) {
+            helmet_state_request_alarm();
+            esp_err_t voice_ret = helmet_voice_play_alert(HELMET_VOICE_ALERT_DANGER);
+            last_alarm_attempt_tick = now;
+
+            ESP_LOGW(
+                TAG,
+                "accident alarm triggered: fall=%d impact=%d roll=%.2f pitch=%.2f voice=%s",
+                fall_detected ? 1 : 0,
+                impact_detected ? 1 : 0,
+                (float)s_k_roll,
+                (float)s_k_pitch,
+                esp_err_to_name(voice_ret)
+            );
+
+            if (voice_ret == ESP_OK) {
+                last_alarm_tick = now;
+                alarm_latched = true;
+            }
+        }
+    } else if (!accident_detected) {
+        alarm_latched = false;
+    }
 
 #if IMU_DEBUG_LOG
     static uint32_t log_count = 0;
