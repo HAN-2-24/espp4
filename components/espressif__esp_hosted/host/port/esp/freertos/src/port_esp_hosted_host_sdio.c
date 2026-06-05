@@ -29,6 +29,7 @@ DEFINE_LOG_TAG(sdio_wrapper);
 #define CIS_BUFFER_SIZE 256
 #define FUNC1_EN_MASK   (BIT(1))
 #define SDIO_INIT_MAX_RETRY 10 // max number of times we try to init SDIO FN 1
+#define SDIO_DMA_BOUNCE_BUFFER_SIZE 2048
 
 #define SDIO_FAIL_IF_NULL(x) do { \
 		if (!x) return ESP_FAIL;  \
@@ -41,6 +42,24 @@ DEFINE_LOG_TAG(sdio_wrapper);
 #define SDIO_UNLOCK(x) do { \
 	if (x) g_h.funcs->_h_unlock_mutex(sdio_bus_lock); \
 } while (0);
+
+static bool sdio_dma_buffer_is_safe(const uint8_t *data, size_t size)
+{
+	if (!data || !size) {
+		return false;
+	}
+
+	const uint8_t *end = data + size - 1;
+
+	return (((uintptr_t)data & (HOSTED_MEM_ALIGNMENT_64 - 1)) == 0) &&
+		esp_ptr_dma_capable(data) &&
+		esp_ptr_dma_capable(end) &&
+		!esp_ptr_external_ram(data) &&
+		!esp_ptr_external_ram(end);
+}
+
+static uint8_t sdio_read_bounce_buf[SDIO_DMA_BOUNCE_BUFFER_SIZE] __attribute__((aligned(64)));
+static uint8_t sdio_write_bounce_buf[SDIO_DMA_BOUNCE_BUFFER_SIZE] __attribute__((aligned(64)));
 
 typedef struct  {
 	sdmmc_card_t *card;
@@ -545,11 +564,14 @@ int hosted_sdio_read_block(void *ctx, uint32_t reg, uint8_t *data, uint16_t size
 		res = sdmmc_io_read_byte(card, SDIO_FUNC_1, reg, data);
 	} else {
 		uint16_t padded = H_SDIO_RX_LEN_TO_TRANSFER(size);
-		if (padded < ESP_BLOCK_SIZE) {
-			static uint8_t bounce_buf[ESP_BLOCK_SIZE] __attribute__((aligned(64)));
-			res = sdio_read_fromio(card, SDIO_FUNC_1, reg, bounce_buf, padded);
+		if (padded < ESP_BLOCK_SIZE || padded != size || !sdio_dma_buffer_is_safe(data, size)) {
+			if (padded > SDIO_DMA_BOUNCE_BUFFER_SIZE) {
+				res = ESP_ERR_NO_MEM;
+			} else {
+				res = sdio_read_fromio(card, SDIO_FUNC_1, reg, sdio_read_bounce_buf, padded);
+			}
 			if (res == ESP_OK) {
-				memcpy(data, bounce_buf, size);
+				memcpy(data, sdio_read_bounce_buf, size);
 			}
 		} else {
 			res = sdio_read_fromio(card, SDIO_FUNC_1, reg, data, padded);
@@ -575,16 +597,22 @@ int hosted_sdio_write_block(void *ctx, uint32_t reg, uint8_t *data, uint16_t siz
 		res = sdmmc_io_write_byte(card, SDIO_FUNC_1, reg, *data, NULL);
 	} else {
 		uint16_t padded = H_SDIO_TX_LEN_TO_TRANSFER(size);
-		ESP_LOGI(TAG, "%s: data=%p size=%u padded=%u align=%u ext=%d",
+		ESP_LOGV(TAG, "%s: data=%p size=%u padded=%u align=%u ext=%d",
 			__func__, data, size, padded,
 			(unsigned)((intptr_t)data & 63),
 			esp_ptr_external_ram(data));
 		/* Use a static bounce buffer for sub-block transfers to avoid
 		 * cache-alignment issues when source buffer is in PSRAM. */
-		if (padded < ESP_BLOCK_SIZE) {
-			static uint8_t bounce_buf[ESP_BLOCK_SIZE] __attribute__((aligned(64)));
-			memcpy(bounce_buf, data, size);
-			res = sdio_write_toio(card, SDIO_FUNC_1, reg, bounce_buf, padded);
+		if (padded < ESP_BLOCK_SIZE || padded != size || !sdio_dma_buffer_is_safe(data, size)) {
+			if (padded > SDIO_DMA_BOUNCE_BUFFER_SIZE) {
+				res = ESP_ERR_NO_MEM;
+			} else {
+				memcpy(sdio_write_bounce_buf, data, size);
+				if (padded > size) {
+					memset(sdio_write_bounce_buf + size, 0, padded - size);
+				}
+				res = sdio_write_toio(card, SDIO_FUNC_1, reg, sdio_write_bounce_buf, padded);
+			}
 		} else {
 			res = sdio_write_toio(card, SDIO_FUNC_1, reg, data, padded);
 		}

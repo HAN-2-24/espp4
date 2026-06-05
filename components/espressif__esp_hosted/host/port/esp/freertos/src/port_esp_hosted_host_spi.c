@@ -8,6 +8,7 @@
 #include "esp_log.h"
 
 #include "driver/spi_master.h"
+#include "esp_memory_utils.h"
 
 #include "transport_drv.h"
 #include "port_esp_hosted_host_spi.h"
@@ -124,6 +125,22 @@ int hosted_do_spi_transfer(void *trans)
 {
     spi_transaction_t t = {0};
     struct hosted_transport_context_t * spi_trans = trans;
+
+    if (!spi_trans || !spi_trans->tx_buf_size || !spi_trans->tx_buf || !spi_trans->rx_buf ||
+            !esp_ptr_internal(spi_trans->tx_buf) ||
+            !esp_ptr_dma_capable(spi_trans->tx_buf) ||
+            !esp_ptr_internal(spi_trans->tx_buf + spi_trans->tx_buf_size - 1) ||
+            !esp_ptr_dma_capable(spi_trans->tx_buf + spi_trans->tx_buf_size - 1) ||
+            !esp_ptr_internal(spi_trans->rx_buf) ||
+            !esp_ptr_dma_capable(spi_trans->rx_buf) ||
+            !esp_ptr_internal(spi_trans->rx_buf + spi_trans->tx_buf_size - 1) ||
+            !esp_ptr_dma_capable(spi_trans->rx_buf + spi_trans->tx_buf_size - 1)) {
+        ESP_LOGE(TAG, "invalid SPI DMA buffer tx=%p rx=%p size=%lu",
+                spi_trans ? spi_trans->tx_buf : NULL,
+                spi_trans ? spi_trans->rx_buf : NULL,
+                spi_trans ? (unsigned long)spi_trans->tx_buf_size : 0);
+        return ESP_ERR_INVALID_ARG;
+    }
 
 #if SPI_WORKAROUND
     /* this ensures RX DMA data in cache is sync to memory */

@@ -1,6 +1,7 @@
 #include "helmet_voice.h"
 
 #include "helmet_state.h"
+#include "helmet_voice_cmd.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -9,10 +10,13 @@
 #include "esp_codec_dev.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "esp_afe_config.h"
 #include "esp_afe_sr_iface.h"
+#include "esp_mn_iface.h"
+#include "esp_mn_models.h"
 #include "model_path.h"
 
 /*
@@ -25,11 +29,13 @@ extern const esp_afe_sr_iface_t *esp_afe_handle_from_config(afe_config_t *afe_co
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 static const char *TAG = "helmet_voice";
 
 static bool s_voice_inited = false;
 static TaskHandle_t s_voice_capture_task_handle = NULL;
+static SemaphoreHandle_t s_voice_output_mutex = NULL;
 
 static esp_codec_dev_handle_t s_spk_codec = NULL;
 static esp_codec_dev_handle_t s_mic_codec = NULL;
@@ -43,23 +49,21 @@ static esp_codec_dev_handle_t s_mic_codec = NULL;
 #define VOICE_CAPTURE_FRAMES              512
 #define VOICE_CAPTURE_INTERVAL_MS         20
 
-#define VOICE_VAD_STOP_THRESHOLD          350
-#define VOICE_VAD_STOP_COUNT              35
-#define VOICE_VAD_AFE_STOP_COUNT          18
-#define VOICE_VAD_GRACE_FRAMES            24
-#define VOICE_VAD_NOISE_MARGIN            120
-#define VOICE_WAKE_TAIL_MIN_FRAMES        18
-#define VOICE_WAKE_TAIL_SILENCE_COUNT     8
-#define VOICE_WAKE_TAIL_MAX_FRAMES        55
-#define VOICE_COMMAND_START_TIMEOUT_FRAMES 120
-#define VOICE_SPEECH_START_COUNT          2
-#define VOICE_LISTEN_MAX_FRAMES           280
+#define VOICE_MN_TIMEOUT_MS               6000
+#define VOICE_MN_DET_THRESHOLD            0.45f
+#define VOICE_CMD_COOLDOWN_MS             1500
 
-#define VOICE_LOG_EVERY_N_FRAMES          50
-#define VOICE_PCM_EVENT_LOG_EVERY_N       25
+#define VOICE_LOG_EVERY_N_FRAMES          500
+#define VOICE_AFE_VAD_ENABLED             0
 
 #define VOICE_ACCIDENT_PCM_PATH           BSP_SPIFFS_MOUNT_POINT "/music/accident.pcm"
 #define VOICE_ALERT_NONE                  (-1)
+#define VOICE_MN_CANCEL_ID                HELMET_VOICE_CMD_CANCEL_ALARM
+#define VOICE_MN_STATUS_ID                HELMET_VOICE_CMD_REPORT_STATUS
+#define VOICE_CMD_CANCEL_TEXT             "取消警报"
+#define VOICE_CMD_CANCEL_PINYIN           "qu xiao jing bao"
+#define VOICE_CMD_STATUS_TEXT             "状态查询"
+#define VOICE_CMD_STATUS_PINYIN           "zhuang tai cha xun"
 
 static int16_t s_capture_pcm[VOICE_CAPTURE_FRAMES];
 
@@ -84,6 +88,18 @@ static esp_afe_sr_data_t *s_afe_data = NULL;
 static int s_afe_feed_chunksize = 0;
 static int s_afe_feed_channel_num = 0;
 
+static srmodel_list_t *s_sr_models = NULL;
+static esp_mn_iface_t *s_mn_handle = NULL;
+static model_iface_data_t *s_mn_data = NULL;
+static int s_mn_chunksize = 0;
+static bool s_mn_ready = false;
+static volatile uint32_t s_mn_detecting_count = 0;
+static volatile uint32_t s_mn_detected_count = 0;
+static volatile uint32_t s_mn_timeout_count = 0;
+static volatile uint32_t s_mn_frame_mismatch_count = 0;
+static volatile int s_mn_last_afe_frames = 0;
+static volatile bool s_voice_streaming = false;
+
 static void make_test_beep(void)
 {
     for (int i = 0; i < TEST_BEEP_FRAMES; i++) {
@@ -92,21 +108,192 @@ static void make_test_beep(void)
     }
 }
 
-static esp_err_t helmet_wake_init(void)
+static bool voice_output_lock(TickType_t ticks_to_wait)
 {
-    ESP_LOGI(TAG, "helmet_wake_init: enter");
+    if (s_voice_output_mutex == NULL) {
+        return true;
+    }
 
-    srmodel_list_t *models = esp_srmodel_init("model");
+    return xSemaphoreTake(s_voice_output_mutex, ticks_to_wait) == pdTRUE;
+}
+
+static void voice_output_unlock(void)
+{
+    if (s_voice_output_mutex != NULL) {
+        xSemaphoreGive(s_voice_output_mutex);
+    }
+}
+
+static void helmet_multinet_clean(void)
+{
+    if (s_mn_ready && s_mn_handle != NULL && s_mn_data != NULL && s_mn_handle->clean != NULL) {
+        s_mn_handle->clean(s_mn_data);
+    }
+}
+
+static bool voice_mn_result_matches(
+    const esp_mn_results_t *results,
+    const char *text,
+    const char *pinyin
+)
+{
+    if (results == NULL) {
+        return false;
+    }
+
+    return strstr(results->string, text) != NULL ||
+           strstr(results->raw_string, text) != NULL ||
+           strstr(results->string, pinyin) != NULL ||
+           strstr(results->raw_string, pinyin) != NULL;
+}
+
+static esp_err_t helmet_multinet_init(srmodel_list_t *models)
+{
     if (models == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_CHINESE);
+    if (mn_name == NULL) {
+        ESP_LOGW(TAG, "MultiNet model not found; fixed commands disabled");
+        return ESP_OK;
+    }
+
+    s_mn_handle = esp_mn_handle_from_name(mn_name);
+    if (s_mn_handle == NULL) {
+        ESP_LOGW(TAG, "esp_mn_handle_from_name failed: %s", mn_name);
+        return ESP_OK;
+    }
+
+    s_mn_data = s_mn_handle->create(mn_name, VOICE_MN_TIMEOUT_MS);
+    if (s_mn_data == NULL) {
+        ESP_LOGW(TAG, "MultiNet create failed: %s", mn_name);
+        return ESP_OK;
+    }
+
+    s_mn_chunksize = s_mn_handle->get_samp_chunksize(s_mn_data);
+    int sample_rate = s_mn_handle->get_samp_rate(s_mn_data);
+    const char *loader_mode = "default";
+
+    if (s_mn_chunksize <= 0) {
+        ESP_LOGW(TAG, "MultiNet chunksize invalid: %d", s_mn_chunksize);
+        return ESP_OK;
+    }
+
+    if (sample_rate != HELMET_AUDIO_SAMPLE_RATE) {
+        ESP_LOGW(TAG, "MultiNet sample rate mismatch: got=%d expected=%d", sample_rate, HELMET_AUDIO_SAMPLE_RATE);
+    }
+
+    if (s_mn_handle->set_det_threshold != NULL) {
+        s_mn_handle->set_det_threshold(s_mn_data, VOICE_MN_DET_THRESHOLD);
+    }
+
+    s_mn_ready = true;
+    helmet_multinet_clean();
+
+    ESP_LOGI(
+        TAG,
+        "MultiNet ready: model=%s chunksize=%d sample_rate=%d commands=offline cancel_id=%d status_id=%d loader=%s no_runtime_commands=1 threshold=%.2f",
+        mn_name,
+        s_mn_chunksize,
+        sample_rate,
+        VOICE_MN_CANCEL_ID,
+        VOICE_MN_STATUS_ID,
+        loader_mode,
+        (double)VOICE_MN_DET_THRESHOLD
+    );
+
+    return ESP_OK;
+}
+
+static helmet_voice_cmd_t helmet_multinet_detect_command(
+    afe_fetch_result_t *afe_res,
+    bool cancel_only
+)
+{
+    if (!s_mn_ready || s_mn_handle == NULL || s_mn_data == NULL || afe_res == NULL || afe_res->data == NULL) {
+        return HELMET_VOICE_CMD_UNKNOWN;
+    }
+
+    int frames = afe_res->data_size / (int)sizeof(int16_t);
+    s_mn_last_afe_frames = frames;
+
+    if (frames != s_mn_chunksize) {
+        s_mn_frame_mismatch_count++;
+        return HELMET_VOICE_CMD_UNKNOWN;
+    }
+
+    esp_mn_state_t state = s_mn_handle->detect(s_mn_data, afe_res->data);
+    if (state == ESP_MN_STATE_TIMEOUT) {
+        s_mn_timeout_count++;
+        helmet_multinet_clean();
+        return HELMET_VOICE_CMD_UNKNOWN;
+    }
+
+    if (state != ESP_MN_STATE_DETECTED) {
+        s_mn_detecting_count++;
+        return HELMET_VOICE_CMD_UNKNOWN;
+    }
+
+    s_mn_detected_count++;
+
+    esp_mn_results_t *results = s_mn_handle->get_results(s_mn_data);
+    if (results == NULL || results->num <= 0) {
+        helmet_multinet_clean();
+        return HELMET_VOICE_CMD_UNKNOWN;
+    }
+
+    int command_id = results->command_id[0];
+    helmet_voice_cmd_t cmd = HELMET_VOICE_CMD_UNKNOWN;
+
+    if (command_id == VOICE_MN_CANCEL_ID &&
+        voice_mn_result_matches(results, VOICE_CMD_CANCEL_TEXT, VOICE_CMD_CANCEL_PINYIN)) {
+        cmd = HELMET_VOICE_CMD_CANCEL_ALARM;
+    } else if (command_id == VOICE_MN_STATUS_ID &&
+               voice_mn_result_matches(results, VOICE_CMD_STATUS_TEXT, VOICE_CMD_STATUS_PINYIN)) {
+        cmd = HELMET_VOICE_CMD_REPORT_STATUS;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "MultiNet command detected: id=%d phrase=%d prob=%.3f text=%s raw=%s",
+        command_id,
+        results->phrase_id[0],
+        (double)results->prob[0],
+        results->string,
+        results->raw_string
+    );
+
+    helmet_multinet_clean();
+
+    if (cancel_only && cmd != HELMET_VOICE_CMD_CANCEL_ALARM) {
+        ESP_LOGI(TAG, "ignore non-cancel command during alert: %d", (int)cmd);
+        return HELMET_VOICE_CMD_UNKNOWN;
+    }
+
+    if (cmd != HELMET_VOICE_CMD_CANCEL_ALARM && cmd != HELMET_VOICE_CMD_REPORT_STATUS) {
+        ESP_LOGW(TAG, "ignore unsupported MultiNet command id=%d", (int)cmd);
+        return HELMET_VOICE_CMD_UNKNOWN;
+    }
+
+    return cmd;
+}
+
+static esp_err_t helmet_sr_init(void)
+{
+    ESP_LOGI(TAG, "helmet_sr_init: enter");
+
+    s_sr_models = esp_srmodel_init("model");
+    if (s_sr_models == NULL) {
         ESP_LOGE(TAG, "esp_srmodel_init failed");
         return ESP_FAIL;
     }
 
     afe_config_t *afe_config = afe_config_init(
         "M",
-        models,
+        s_sr_models,
         AFE_TYPE_SR,
-        AFE_MODE_HIGH_PERF
+        AFE_MODE_LOW_COST
     );
 
     if (afe_config == NULL) {
@@ -114,9 +301,18 @@ static esp_err_t helmet_wake_init(void)
         return ESP_FAIL;
     }
 
+#if VOICE_AFE_VAD_ENABLED
     afe_config->vad_init = true;
     afe_config->vad_mode = VAD_MODE_2;
     afe_config->vad_min_noise_ms = 600;
+#else
+    afe_config->vad_init = false;
+#endif
+    afe_config->wakenet_init = false;
+    afe_config->wakenet_model_name = NULL;
+    afe_config->wakenet_model_name_2 = NULL;
+    afe_config->fixed_first_channel = true;
+    afe_config->fixed_output_channel = true;
 
     s_afe_handle = esp_afe_handle_from_config(afe_config);
     if (s_afe_handle == NULL) {
@@ -138,17 +334,23 @@ static esp_err_t helmet_wake_init(void)
 
     ESP_LOGI(
         TAG,
-        "WakeNet ready: feed_chunksize=%d feed_channel_num=%d",
+        "AFE ready: direct MultiNet mode=low_cost feed_chunksize=%d feed_channel_num=%d vad=%s",
         s_afe_feed_chunksize,
-        s_afe_feed_channel_num
+        s_afe_feed_channel_num,
+        VOICE_AFE_VAD_ENABLED ? "on" : "off"
     );
 
     s_afe_handle->print_pipeline(s_afe_data);
 
+    esp_err_t mn_ret = helmet_multinet_init(s_sr_models);
+    if (mn_ret != ESP_OK) {
+        ESP_LOGW(TAG, "helmet_multinet_init ret=%s", esp_err_to_name(mn_ret));
+    }
+
     return ESP_OK;
 }
 
-static void helmet_wake_reset(void)
+static void helmet_sr_reset(void)
 {
     if (s_afe_handle != NULL && s_afe_data != NULL) {
         s_afe_handle->reset_buffer(s_afe_data);
@@ -205,26 +407,6 @@ static afe_fetch_result_t *helmet_afe_feed_fetch(const int16_t *pcm, size_t fram
     return res;
 }
 
-static bool helmet_wake_detect_feed(const int16_t *pcm, size_t frames)
-{
-    afe_fetch_result_t *res = helmet_afe_feed_fetch(pcm, frames);
-    if (res == NULL) {
-        return false;
-    }
-
-    if (res->wakeup_state == WAKENET_DETECTED) {
-        ESP_LOGI(
-            TAG,
-            "WAKE DETECTED wake_word_index=%d",
-            res->wake_word_index
-        );
-
-        return true;
-    }
-
-    return false;
-}
-
 static int voice_calc_avg_abs(const int16_t *pcm, size_t frames)
 {
     if (pcm == NULL || frames == 0) {
@@ -241,97 +423,35 @@ static int voice_calc_avg_abs(const int16_t *pcm, size_t frames)
     return (int)(sum_abs / frames);
 }
 
-static int voice_update_noise_floor(int current, int avg_abs)
+static bool voice_try_cancel_from_mic(void)
 {
-    if (avg_abs <= 0) {
-        return current;
+    if (!s_mn_ready) {
+        return false;
     }
 
-    if (current <= 0) {
-        return avg_abs;
-    }
-
-    return ((current * 7) + avg_abs) / 8;
-}
-
-static void voice_capture_print_stats(const int16_t *pcm, size_t frames, int avg_abs)
-{
-    if (pcm == NULL || frames < 4) {
-        return;
-    }
-
-    int16_t min_v = pcm[0];
-    int16_t max_v = pcm[0];
-
-    for (size_t i = 0; i < frames; i++) {
-        int16_t v = pcm[i];
-
-        if (v < min_v) {
-            min_v = v;
-        }
-
-        if (v > max_v) {
-            max_v = v;
-        }
-    }
-
-    ESP_LOGI(
-        TAG,
-        "voice pcm: frames=%u min=%d max=%d avg_abs=%d runtime=%d first=%d %d %d %d",
-        (unsigned)frames,
-        min_v,
-        max_v,
-        avg_abs,
-        (int)s_voice_runtime,
-        pcm[0],
-        pcm[1],
-        pcm[2],
-        pcm[3]
+    size_t frames_read = 0;
+    esp_err_t ret = helmet_voice_read_pcm(
+        s_capture_pcm,
+        VOICE_CAPTURE_FRAMES,
+        &frames_read
     );
-}
 
-static void voice_on_listen_start(int avg_abs)
-{
-    s_voice_runtime = VOICE_RUNTIME_LISTENING;
-
-    ESP_LOGI(
-        TAG,
-        "EVENT: LISTEN_START by WakeNet avg_abs=%d",
-        avg_abs
-    );
-}
-
-static void voice_on_pcm_frame(const int16_t *pcm, size_t frames)
-{
-    static int pcm_event_count = 0;
-
-    if (pcm == NULL || frames < 4) {
-        return;
+    if (ret != ESP_OK || frames_read == 0) {
+        return false;
     }
 
-    if ((pcm_event_count++ % VOICE_PCM_EVENT_LOG_EVERY_N) == 0) {
-        ESP_LOGI(
-            TAG,
-            "EVENT: PCM_FRAME frames=%u first=%d %d %d %d",
-            (unsigned)frames,
-            pcm[0],
-            pcm[1],
-            pcm[2],
-            pcm[3]
-        );
+    afe_fetch_result_t *afe_res = helmet_afe_feed_fetch(s_capture_pcm, frames_read);
+    helmet_voice_cmd_t cmd = helmet_multinet_detect_command(afe_res, true);
+
+    if (cmd != HELMET_VOICE_CMD_CANCEL_ALARM) {
+        return false;
     }
-}
 
-static void voice_on_listen_stop(int avg_abs, const char *reason)
-{
-    s_voice_runtime = VOICE_RUNTIME_IDLE;
+    ESP_LOGI(TAG, "cancel command detected during alert playback");
+    ret = helmet_voice_cmd_execute(cmd);
+    ESP_LOGI(TAG, "cancel command executed ret=%s", esp_err_to_name(ret));
 
-    ESP_LOGI(
-        TAG,
-        "EVENT: LISTEN_STOP reason=%s avg_abs=%d no recognizer active",
-        (reason != NULL) ? reason : "unknown",
-        avg_abs
-    );
+    return ret == ESP_OK;
 }
 
 static esp_err_t test_speaker_once(void)
@@ -348,11 +468,11 @@ static esp_err_t test_speaker_once(void)
 
     ESP_LOGI(TAG, "speaker test: write bytes=%u", (unsigned)sizeof(s_beep));
 
-    esp_err_t ret = esp_codec_dev_write(
-        s_spk_codec,
-        s_beep,
-        sizeof(s_beep)
-    );
+    esp_err_t ret = ESP_ERR_TIMEOUT;
+    if (voice_output_lock(pdMS_TO_TICKS(200))) {
+        ret = esp_codec_dev_write(s_spk_codec, s_beep, sizeof(s_beep));
+        voice_output_unlock();
+    }
 
     vTaskDelay(pdMS_TO_TICKS(150));
 
@@ -407,14 +527,21 @@ static esp_err_t voice_play_pcm_file(const char *path)
             continue;
         }
 
-        ret = esp_codec_dev_write(
-            s_spk_codec,
-            s_beep,
-            bytes_read
-        );
+        if (!voice_output_lock(pdMS_TO_TICKS(200))) {
+            ESP_LOGW(TAG, "speaker output lock timeout");
+            ret = ESP_ERR_TIMEOUT;
+            break;
+        }
+
+        ret = esp_codec_dev_write(s_spk_codec, s_beep, bytes_read);
+        voice_output_unlock();
 
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "write pcm failed: %s", esp_err_to_name(ret));
+            break;
+        }
+
+        if (voice_try_cancel_from_mic()) {
             break;
         }
     }
@@ -450,6 +577,7 @@ static esp_err_t voice_play_alert_now(helmet_voice_alert_t alert)
     s_voice_output_busy = true;
     s_voice_runtime = VOICE_RUNTIME_PLAYING;
     helmet_state_set_voice(HELMET_VOICE_PLAYING);
+    helmet_multinet_clean();
 
     if (pcm_path != NULL) {
         ret = voice_play_pcm_file(pcm_path);
@@ -463,7 +591,7 @@ static esp_err_t voice_play_alert_now(helmet_voice_alert_t alert)
         helmet_state_set_voice(HELMET_VOICE_ERROR);
     }
 
-    helmet_wake_reset();
+    helmet_sr_reset();
 
     s_voice_runtime = VOICE_RUNTIME_IDLE;
     s_voice_output_busy = false;
@@ -520,19 +648,11 @@ static void voice_capture_task(void *arg)
 {
     (void)arg;
 
-    ESP_LOGI(TAG, "voice capture task: start");
+    ESP_LOGI(TAG, "voice capture task: start direct MultiNet mode");
 
-    bool speaking = false;
-    int stop_count = 0;
     int log_count = 0;
-    int listen_frame_count = 0;
-    int ambient_avg_abs = 0;
-    int listen_noise_floor = 0;
-    int speech_count = 0;
-    int wake_tail_silence_count = 0;
-    int command_wait_count = 0;
-    bool heard_speech = false;
-    bool command_armed = false;
+    helmet_voice_cmd_t last_cmd = HELMET_VOICE_CMD_UNKNOWN;
+    TickType_t last_cmd_tick = 0;
 
     while (1) {
         voice_service_pending_alert();
@@ -552,150 +672,55 @@ static void voice_capture_task(void *arg)
 
         if (ret == ESP_OK && frames_read > 0) {
             int avg_abs = voice_calc_avg_abs(s_capture_pcm, frames_read);
+            afe_fetch_result_t *afe_res = helmet_afe_feed_fetch(s_capture_pcm, frames_read);
+            int vad_state = -1;
 
-            if (!speaking) {
-                if (helmet_wake_detect_feed(s_capture_pcm, frames_read)) {
-                    speaking = true;
-                    stop_count = 0;
-                    log_count = 0;
-                    listen_frame_count = 0;
-                    listen_noise_floor = ambient_avg_abs;
-                    speech_count = 0;
-                    wake_tail_silence_count = 0;
-                    command_wait_count = 0;
-                    heard_speech = false;
-                    command_armed = false;
+#if VOICE_AFE_VAD_ENABLED
+            vad_state = (afe_res != NULL) ? (int)afe_res->vad_state : -1;
+#endif
 
-                    voice_on_listen_start(avg_abs);
+            helmet_voice_cmd_t detected_cmd = helmet_multinet_detect_command(afe_res, false);
+            if (detected_cmd != HELMET_VOICE_CMD_UNKNOWN) {
+                TickType_t now = xTaskGetTickCount();
+                bool duplicate = (detected_cmd == last_cmd) &&
+                                 (last_cmd_tick != 0) &&
+                                 ((now - last_cmd_tick) < pdMS_TO_TICKS(VOICE_CMD_COOLDOWN_MS));
+
+                if (duplicate) {
+                    ESP_LOGI(TAG, "command ignored by cooldown: id=%d", (int)detected_cmd);
                 } else {
-                    ambient_avg_abs = voice_update_noise_floor(ambient_avg_abs, avg_abs);
-                }
-            } else {
-                afe_fetch_result_t *afe_res = helmet_afe_feed_fetch(s_capture_pcm, frames_read);
-                int vad_state = (afe_res != NULL) ? (int)afe_res->vad_state : -1;
-                int energy_stop_threshold = VOICE_VAD_STOP_THRESHOLD;
+                    esp_err_t cmd_ret = helmet_voice_cmd_execute(detected_cmd);
 
-                if (listen_noise_floor > 0 &&
-                    (listen_noise_floor + VOICE_VAD_NOISE_MARGIN) > energy_stop_threshold) {
-                    energy_stop_threshold = listen_noise_floor + VOICE_VAD_NOISE_MARGIN;
-                }
-
-                bool afe_silence = (afe_res != NULL && afe_res->vad_state == VAD_SILENCE);
-                bool afe_speech = (afe_res != NULL && afe_res->vad_state == VAD_SPEECH);
-                bool energy_silence = (avg_abs <= energy_stop_threshold);
-                bool energy_speech = (avg_abs > energy_stop_threshold);
-                bool speech_detected = afe_speech || energy_speech;
-                bool silence_detected = (afe_silence && !energy_speech) ||
-                                        (!afe_speech && energy_silence);
-                bool can_stop = (listen_frame_count >= VOICE_VAD_GRACE_FRAMES);
-                bool stop_by_timeout = false;
-                const char *stop_reason = NULL;
-
-                if (!command_armed) {
-                    if (silence_detected && listen_frame_count >= VOICE_WAKE_TAIL_MIN_FRAMES) {
-                        wake_tail_silence_count++;
-                    } else if (!silence_detected && wake_tail_silence_count > 0) {
-                        wake_tail_silence_count--;
-                    }
-
-                    if (wake_tail_silence_count >= VOICE_WAKE_TAIL_SILENCE_COUNT ||
-                        listen_frame_count >= VOICE_WAKE_TAIL_MAX_FRAMES) {
-                        command_armed = true;
-                        command_wait_count = 0;
-                        speech_count = 0;
-                        stop_count = 0;
-
-                        ESP_LOGI(
-                            TAG,
-                            "EVENT: COMMAND_ARMED vad=%d avg_abs=%d threshold=%d frame=%d tail_silence=%d",
-                            vad_state,
-                            avg_abs,
-                            energy_stop_threshold,
-                            listen_frame_count,
-                            wake_tail_silence_count
-                        );
-                    }
-                } else if (!heard_speech) {
-                    command_wait_count++;
-
-                    if (speech_detected) {
-                        if (speech_count < VOICE_SPEECH_START_COUNT) {
-                            speech_count++;
-                        }
-                    } else if (speech_count > 0) {
-                        speech_count--;
-                    }
-
-                    if (speech_count >= VOICE_SPEECH_START_COUNT) {
-                        heard_speech = true;
-                        stop_count = 0;
-
-                        ESP_LOGI(
-                            TAG,
-                            "EVENT: COMMAND_SPEECH_START vad=%d avg_abs=%d threshold=%d",
-                            vad_state,
-                            avg_abs,
-                            energy_stop_threshold
-                        );
-                    }
-                }
-
-                voice_on_pcm_frame(s_capture_pcm, frames_read);
-
-                if ((log_count++ % VOICE_LOG_EVERY_N_FRAMES) == 0) {
-                    voice_capture_print_stats(s_capture_pcm, frames_read, avg_abs);
                     ESP_LOGI(
                         TAG,
-                        "listen monitor: vad=%d avg_abs=%d threshold=%d stop=%d frame=%d armed=%d heard=%d speech=%d wait=%d tail=%d",
-                        vad_state,
-                        avg_abs,
-                        energy_stop_threshold,
-                        stop_count,
-                        listen_frame_count,
-                        command_armed ? 1 : 0,
-                        heard_speech ? 1 : 0,
-                        speech_count,
-                        command_wait_count,
-                        wake_tail_silence_count
+                        "command executed: id=%d ret=%s",
+                        (int)detected_cmd,
+                        esp_err_to_name(cmd_ret)
                     );
+
+                    last_cmd = detected_cmd;
+                    last_cmd_tick = now;
                 }
 
-                listen_frame_count++;
+                helmet_sr_reset();
+                vTaskDelay(pdMS_TO_TICKS(VOICE_CAPTURE_INTERVAL_MS));
+                continue;
+            }
 
-                if (listen_frame_count >= VOICE_LISTEN_MAX_FRAMES) {
-                    stop_by_timeout = true;
-                    stop_reason = "timeout";
-                } else if (command_armed &&
-                           !heard_speech &&
-                           command_wait_count >= VOICE_COMMAND_START_TIMEOUT_FRAMES) {
-                    stop_by_timeout = true;
-                    stop_reason = "speech_start_timeout";
-                } else if (heard_speech && can_stop && silence_detected) {
-                    stop_count++;
-
-                    if (afe_silence && stop_count >= VOICE_VAD_AFE_STOP_COUNT) {
-                        stop_reason = "afe_silence";
-                    } else if (!afe_speech && stop_count >= VOICE_VAD_STOP_COUNT) {
-                        stop_reason = "energy_silence";
-                    }
-                } else {
-                    stop_count = 0;
-                }
-
-                if (stop_by_timeout || stop_reason != NULL) {
-                    speaking = false;
-                    stop_count = 0;
-                    log_count = 0;
-                    listen_frame_count = 0;
-                    speech_count = 0;
-                    wake_tail_silence_count = 0;
-                    command_wait_count = 0;
-                    heard_speech = false;
-                    command_armed = false;
-
-                    voice_on_listen_stop(avg_abs, stop_reason);
-                    helmet_wake_reset();
-                }
+            if ((log_count++ % VOICE_LOG_EVERY_N_FRAMES) == 0) {
+                ESP_LOGI(
+                    TAG,
+                    "direct command monitor: mn_ready=%d vad=%d avg_abs=%d afe_frames=%d mn_need=%d detecting=%lu detected=%lu timeout=%lu mismatch=%lu",
+                    s_mn_ready ? 1 : 0,
+                    vad_state,
+                    avg_abs,
+                    s_mn_last_afe_frames,
+                    s_mn_chunksize,
+                    (unsigned long)s_mn_detecting_count,
+                    (unsigned long)s_mn_detected_count,
+                    (unsigned long)s_mn_timeout_count,
+                    (unsigned long)s_mn_frame_mismatch_count
+                );
             }
         } else {
             ESP_LOGW(
@@ -745,6 +770,15 @@ esp_err_t helmet_voice_init(void)
         ESP_LOGI(TAG, "helmet_voice_init: already initialized");
         helmet_state_set_voice(HELMET_VOICE_READY);
         return ESP_OK;
+    }
+
+    if (s_voice_output_mutex == NULL) {
+        s_voice_output_mutex = xSemaphoreCreateMutex();
+        if (s_voice_output_mutex == NULL) {
+            ESP_LOGE(TAG, "create voice output mutex failed");
+            helmet_state_set_voice(HELMET_VOICE_ERROR);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     s_spk_codec = bsp_audio_codec_speaker_init();
@@ -801,8 +835,8 @@ esp_err_t helmet_voice_init(void)
     s_voice_runtime = VOICE_RUNTIME_IDLE;
     helmet_state_set_voice(HELMET_VOICE_READY);
 
-    ret = helmet_wake_init();
-    ESP_LOGI(TAG, "helmet_wake_init ret=%s", esp_err_to_name(ret));
+    ret = helmet_sr_init();
+    ESP_LOGI(TAG, "helmet_sr_init ret=%s", esp_err_to_name(ret));
 
     if (ret != ESP_OK) {
         helmet_state_set_voice(HELMET_VOICE_ERROR);
@@ -851,12 +885,103 @@ esp_err_t helmet_voice_play_alert(helmet_voice_alert_t alert)
     return ESP_OK;
 }
 
+esp_err_t helmet_voice_stream_pcm_begin(void)
+{
+    if (!s_voice_inited || s_spk_codec == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!voice_output_lock(pdMS_TO_TICKS(200))) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (s_voice_output_busy || s_pending_alert != VOICE_ALERT_NONE) {
+        voice_output_unlock();
+        ESP_LOGW(TAG, "voice output busy, skip pcm stream");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_voice_stop_requested = false;
+    s_voice_streaming = true;
+    s_voice_output_busy = true;
+    s_voice_runtime = VOICE_RUNTIME_PLAYING;
+    helmet_state_set_voice(HELMET_VOICE_PLAYING);
+
+    voice_output_unlock();
+
+    ESP_LOGI(TAG, "pcm stream begin");
+
+    return ESP_OK;
+}
+
+esp_err_t helmet_voice_stream_pcm_write(const void *pcm, size_t bytes)
+{
+    if (!s_voice_inited || s_spk_codec == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (pcm == NULL || bytes == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_voice_streaming || s_voice_stop_requested) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if ((bytes & 1U) != 0U) {
+        bytes--;
+    }
+
+    if (bytes == 0) {
+        return ESP_OK;
+    }
+
+    if (!voice_output_lock(pdMS_TO_TICKS(500))) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t ret = esp_codec_dev_write(s_spk_codec, (void *)pcm, bytes);
+    voice_output_unlock();
+
+    return ret;
+}
+
+esp_err_t helmet_voice_stream_pcm_end(void)
+{
+    if (!voice_output_lock(pdMS_TO_TICKS(200))) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (s_voice_streaming) {
+        ESP_LOGI(TAG, "pcm stream end");
+    }
+
+    s_voice_streaming = false;
+    s_voice_output_busy = false;
+    s_voice_stop_requested = false;
+    s_voice_runtime = VOICE_RUNTIME_IDLE;
+    helmet_state_set_voice(HELMET_VOICE_READY);
+
+    voice_output_unlock();
+
+    return ESP_OK;
+}
+
 esp_err_t helmet_voice_stop(void)
 {
     ESP_LOGI(TAG, "voice stop");
 
     s_voice_stop_requested = true;
     s_pending_alert = VOICE_ALERT_NONE;
+
+    if (s_voice_streaming) {
+        s_voice_streaming = false;
+        s_voice_output_busy = false;
+        s_voice_runtime = VOICE_RUNTIME_IDLE;
+        s_voice_stop_requested = false;
+        helmet_state_set_voice(HELMET_VOICE_READY);
+        return ESP_OK;
+    }
 
     if (!s_voice_output_busy) {
         s_voice_runtime = VOICE_RUNTIME_IDLE;

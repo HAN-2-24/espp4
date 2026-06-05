@@ -1,0 +1,56 @@
+menu "Helmet Cloud / EMQX"
+
+    config HELMET_MQTT_URI
+        string "MQTT broker URI"
+        default ""
+        help
+            EMQX broker URI. Use mqtt://host:1883 for plain TCP or
+            mqtts://host:8883 for TLS.
+
+    config HELMET_MQTT_CLIENT_ID
+        string "MQTT client ID"
+        default ""
+        help
+            Optional fixed MQTT client ID. Leave empty to let esp-mqtt
+            generate one.
+
+    config HELMET_MQTT_USERNAME
+        string "MQTT username"
+        default ""
+
+    config HELMET_MQTT_PASSWORD
+        string "MQTT password"
+        default ""
+
+    config HELMET_MQTT_USE_EMBEDDED_CA
+        bool "Use embedded EMQX CA certificate"
+        default y
+        help
+            Use components/helmet_drivers/certs/emqx_ca.pem to validate
+            mqtts:// connections. Plain mqtt:// connections ignore this.
+
+    config HELMET_MQTT_TOPIC_ATTR
+        string "Telemetry publish topic"
+        default "helmet/attributes"
+
+    config HELMET_MQTT_TOPIC_STATUS_QUERY
+        string "Status query publish topic"
+        default "helmet/voice/status/query"
+
+    config HELMET_MQTT_TOPIC_STATUS_PCM
+        string "Status PCM response topic prefix"
+        default "helmet/voice/status/pcm"
+        help
+            The device subscribes to this prefix plus /# and expects chunks
+            on <prefix>/<request_id>/<seq>/<flags>.
+
+    config HELMET_CLOUD_REPORT_INTERVAL_MS
+        int "Telemetry report interval in ms"
+        default 30000
+        range 1000 600000
+
+    config HELMET_CLOUD_DEBUG_LOG
+        bool "Enable helmet cloud debug logs"
+        default y
+
+endmenu

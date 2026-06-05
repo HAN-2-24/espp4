@@ -45,6 +45,7 @@ static const char *TAG = "helmet_imu";
 
 #define PI_F                         3.14159265358979f
 #define RAD2DEG_F                    57.29578f
+#define DEG2RAD_F                    0.017453292519943295f
 #define GRAVITY_F                    9.80665f
 
 #define IMU_DEBUG_LOG                1
@@ -78,6 +79,7 @@ static i2c_master_dev_handle_t s_mpu_dev = NULL;
 static uint8_t s_mpu_addr = MPU6050_ADDR_0;
 
 static imu_vec3_t s_acc_offset = {0};
+static float s_acc_gravity_sign = 1.0f;
 static imu_vec3_t s_gyr_offset = {0};
 
 static double s_roll_v = 0.0;
@@ -541,7 +543,11 @@ static esp_err_t imu_calibrate_offsets(void)
 
     int32_t ax_offset_raw = (int32_t)(ax_sum / IMU_CALIBRATION_SAMPLES);
     int32_t ay_offset_raw = (int32_t)(ay_sum / IMU_CALIBRATION_SAMPLES);
-    int32_t az_offset_raw = (int32_t)(az_sum / IMU_CALIBRATION_SAMPLES) - 2048;
+    int32_t az_mean_raw = (int32_t)(az_sum / IMU_CALIBRATION_SAMPLES);
+    int32_t az_expected_raw = (az_mean_raw < 0) ? -2048 : 2048;
+    int32_t az_offset_raw = az_mean_raw - az_expected_raw;
+
+    s_acc_gravity_sign = (az_expected_raw < 0) ? -1.0f : 1.0f;
 
     int32_t gx_offset_raw = (int32_t)(gx_sum / IMU_CALIBRATION_SAMPLES);
     int32_t gy_offset_raw = (int32_t)(gy_sum / IMU_CALIBRATION_SAMPLES);
@@ -588,6 +594,10 @@ static void imu_remove_gravity_acceleration(
     float gy = g * cosf((float)pitch * (PI_F / 180.0f)) * sinf((float)roll * (PI_F / 180.0f));
     float gz = g * cosf((float)pitch * (PI_F / 180.0f)) * cosf((float)roll * (PI_F / 180.0f));
 
+    gx *= s_acc_gravity_sign;
+    gy *= s_acc_gravity_sign;
+    gz *= s_acc_gravity_sign;
+
     acc_body->x = acc_raw->x + gx;
     acc_body->y = acc_raw->y - gy;
     acc_body->z = acc_raw->z - gz;
@@ -607,14 +617,22 @@ static void imu_update_attitude(
         dt = (double)IMU_SAMPLE_PERIOD_MS / 1000.0;
     }
 
+    double roll_rad = s_k_roll * DEG2RAD_F;
+    double pitch_rad = s_k_pitch * DEG2RAD_F;
+    double cos_pitch = cos(pitch_rad);
+
+    if (fabs(cos_pitch) < 1e-6) {
+        cos_pitch = (cos_pitch < 0.0) ? -1e-6 : 1e-6;
+    }
+
     s_roll_v =
         real_gyr->x +
-        ((sin(s_k_pitch) * sin(s_k_roll)) / cos(s_k_pitch)) * real_gyr->y +
-        ((sin(s_k_pitch) * cos(s_k_roll)) / cos(s_k_pitch)) * real_gyr->z;
+        ((sin(pitch_rad) * sin(roll_rad)) / cos_pitch) * real_gyr->y +
+        ((sin(pitch_rad) * cos(roll_rad)) / cos_pitch) * real_gyr->z;
 
     s_pitch_v =
-        cos(s_k_roll) * real_gyr->y -
-        sin(s_k_roll) * real_gyr->z;
+        cos(roll_rad) * real_gyr->y -
+        sin(roll_rad) * real_gyr->z;
 
     s_gyro_roll = s_k_roll + dt * s_roll_v;
     s_gyro_pitch = s_k_pitch + dt * s_pitch_v;
@@ -629,11 +647,15 @@ static void imu_update_attitude(
     s_k_k[1][0] = 0.0;
     s_k_k[1][1] = s_e_p[1][1] / (s_e_p[1][1] + 0.3);
 
-    s_acc_roll = atan(real_acc->y / real_acc->z) * RAD2DEG_F;
+    double acc_x = (double)s_acc_gravity_sign * (double)real_acc->x;
+    double acc_y = (double)s_acc_gravity_sign * (double)real_acc->y;
+    double acc_z = (double)s_acc_gravity_sign * (double)real_acc->z;
+
+    s_acc_roll = atan2(acc_y, acc_z) * RAD2DEG_F;
 
     s_acc_pitch =
         -1.0 *
-        atan(real_acc->x / sqrt(sqf_local(real_acc->y) + sqf_local(real_acc->z))) *
+        atan2(acc_x, sqrt((acc_y * acc_y) + (acc_z * acc_z))) *
         RAD2DEG_F;
 
     s_k_roll = s_gyro_roll + s_k_k[0][0] * (s_acc_roll - s_gyro_roll);

@@ -87,10 +87,6 @@ extern "C" void app_main(void)
 
 
 
-    AppSettings *app_settings = new AppSettings();
-    assert(app_settings != nullptr && "Failed to create app_settings");
-    assert((phone->installApp(app_settings) >= 0) && "Failed to begin app_settings");
-
     HelmetDashboard *helmet_dashboard = new HelmetDashboard();
     assert(helmet_dashboard != nullptr && "Failed to create helmet_dashboard");
     assert((phone->installApp(helmet_dashboard) >= 0) && "Failed to install helmet_dashboard");

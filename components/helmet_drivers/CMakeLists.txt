@@ -13,9 +13,13 @@ idf_component_register(
         esp_timer
         helmet_board
         helmet_core
-	mqtt
-        esp_wifi
+        mqtt
         esp_event
         esp_netif
-	esp32_p4_function_ev_board_noglib
+        esp_wifi
+        espressif__esp_hosted
+        espressif__esp-sr
+        esp32_p4_function_ev_board_noglib
+    EMBED_TXTFILES
+        "certs/emqx_ca.pem"
 )

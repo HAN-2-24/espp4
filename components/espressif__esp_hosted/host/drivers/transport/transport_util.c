@@ -5,6 +5,7 @@
  */
 
 #include "esp_hosted_os_abstraction.h"
+#include "esp_heap_caps.h"
 #include "port_esp_hosted_host_os.h"
 #include "transport_util.h"
 

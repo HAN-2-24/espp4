@@ -89,9 +89,9 @@ static void transport_driver_event_handler(uint8_t event)
 		{
 			/* Initiate control path now */
 			ESP_LOGI(TAG, "Base transport is set-up, TRANSPORT_TX_ACTIVE");
+			transport_state = TRANSPORT_TX_ACTIVE;
 			if (transport_esp_hosted_up_cb)
 				transport_esp_hosted_up_cb();
-			transport_state = TRANSPORT_TX_ACTIVE;
 			break;
 		}
 
@@ -152,17 +152,21 @@ esp_err_t teardown_transport(void)
 esp_err_t setup_transport(void(*esp_hosted_up_cb)(void))
 {
 	g_h.funcs->_h_hosted_init_hook();
-	transport_drv_init();
 	transport_esp_hosted_up_cb = esp_hosted_up_cb;
+	transport_drv_init();
+
+	if (is_transport_tx_ready() && transport_esp_hosted_up_cb) {
+		transport_esp_hosted_up_cb();
+	}
 
 	return ESP_OK;
 }
 
 esp_err_t transport_drv_reconfigure(void)
 {
-	static int retry_slave_connection = 0;
+	int retry_slave_connection = 0;
 
-	ESP_LOGI(TAG, "Attempt connection with slave: retry[%u]", retry_slave_connection);
+	ESP_LOGD(TAG, "Attempt connection with slave");
 
 #if H_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE && H_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE_TIMEOUT_MS != -1
 	/* Start init timeout timer if not already started */
@@ -218,7 +222,6 @@ esp_err_t transport_drv_reconfigure(void)
 		ESP_LOGI(TAG, "Transport is already up");
 	}
 
-	retry_slave_connection = 0;
 	return ESP_OK;
 }
 

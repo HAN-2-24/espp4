@@ -18,6 +18,8 @@
 #include "esp_hosted_power_save.h"
 #include "esp_hosted_transport_config.h"
 #include "esp_hosted_bt.h"
+#include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #include "port_esp_hosted_host_config.h"
 #include "port_esp_hosted_host_log.h"
 #include "port_esp_hosted_host_os.h"
@@ -45,6 +47,8 @@ DEFINE_LOG_TAG(spi);
 #define MIN_MEMPOOL_REQ (MIN_MEMPOOL_BT_PACKETS + MIN_MEMPOOL_SERIAL_PACKETS + MIN_MEMPOOL_NET_PACKETS)
 #endif
 
+#define SPI_DMA_POOL_BLOCKS 4
+
 void * spi_handle = NULL;
 semaphore_handle_t spi_trans_ready_sem;
 static volatile uint8_t dr_isr_triggered = 0;
@@ -59,6 +63,11 @@ extern transport_channel_t *chan_arr[ESP_MAX_IF];
 /* Create mempool for cache mallocs */
 static hosted_mempool_t * buf_mp_g;
 #endif
+
+static uint8_t *spi_dma_pool[SPI_DMA_POOL_BLOCKS];
+static uint8_t spi_dma_pool_in_use[SPI_DMA_POOL_BLOCKS];
+static uint8_t spi_dma_pool_count;
+static portMUX_TYPE spi_dma_pool_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /** Exported variables **/
 
@@ -78,6 +87,7 @@ static void * spi_rx_thread;
 static void spi_transaction_task(void const* pvParameters);
 static void spi_process_rx_task(void const* pvParameters);
 static uint8_t * get_next_tx_buffer(uint8_t *is_valid_tx_buf, void (**free_func)(void* ptr));
+static inline void spi_buffer_free(void *buf);
 
 #if H_HOST_USES_STATIC_NETIF
 /* Netif creation is now handled by the example code */
@@ -123,42 +133,105 @@ static esp_err_t create_static_netif(void)
 
 static inline void spi_mempool_create(int tx_q_size, int rx_q_size)
 {
+	(void)tx_q_size;
+	(void)rx_q_size;
 	MEM_DUMP("spi_mempool_create");
 #if H_USE_MEMPOOL
-	hosted_mempool_config_t config = {
-		.pre_allocated_mem = NULL,
-		.pre_allocated_mem_size = 0,
-		// allocate enough blocks to handle full RX and possible peak tx requests
-		.num_blocks = rx_q_size + MIN_MEMPOOL_REQ,
-		.block_size = MAX_SPI_BUFFER_SIZE,
-		.alignment_in_bytes = HOSTED_MEM_ALIGNMENT_64,
-		.malloc = transport_util_malloc,
-		.calloc = transport_util_calloc,
-		.memset = g_h.funcs->_h_memset,
-		.free   = g_h.funcs->_h_free,
-	};
-	buf_mp_g = hosted_mempool_create(&config);
-	assert(buf_mp_g);
+	buf_mp_g = NULL;
 #endif
+
+	for (uint8_t i = 0; i < SPI_DMA_POOL_BLOCKS; i++) {
+		spi_dma_pool[i] = heap_caps_aligned_alloc(HOSTED_MEM_ALIGNMENT_64,
+				MAX_SPI_BUFFER_SIZE,
+				MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+		if (!spi_dma_pool[i]) {
+			ESP_LOGW(TAG, "SPI DMA pool block %u alloc failed, largest internal DMA block=%u",
+					i,
+					(unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+			break;
+		}
+		spi_dma_pool_in_use[i] = 0;
+		spi_dma_pool_count++;
+	}
+
+	ESP_LOGI(TAG, "SPI DMA pool ready: %u x %u bytes",
+			spi_dma_pool_count, MAX_SPI_BUFFER_SIZE);
 }
 
 static inline void spi_mempool_destroy(void)
 {
+	for (uint8_t i = 0; i < spi_dma_pool_count; i++) {
+		heap_caps_free(spi_dma_pool[i]);
+		spi_dma_pool[i] = NULL;
+		spi_dma_pool_in_use[i] = 0;
+	}
+	spi_dma_pool_count = 0;
+
 #if H_USE_MEMPOOL
 	ESP_LOGD(TAG, "Destroying SPI mempool");
-	hosted_mempool_destroy(buf_mp_g);
-	buf_mp_g = NULL;
+	if (buf_mp_g) {
+		hosted_mempool_destroy(buf_mp_g);
+		buf_mp_g = NULL;
+	}
 #endif
 }
 
 static inline void *spi_buffer_alloc(uint32_t need_memset)
 {
-	MEMPOOL_ALLOC(buf_mp_g, MAX_SPI_BUFFER_SIZE, need_memset);
+	void *buf = NULL;
+
+	portENTER_CRITICAL(&spi_dma_pool_lock);
+	for (uint8_t i = 0; i < spi_dma_pool_count; i++) {
+		if (!spi_dma_pool_in_use[i]) {
+			spi_dma_pool_in_use[i] = 1;
+			buf = spi_dma_pool[i];
+			break;
+		}
+	}
+	portEXIT_CRITICAL(&spi_dma_pool_lock);
+
+	if (!buf) {
+		buf = heap_caps_aligned_alloc(HOSTED_MEM_ALIGNMENT_64, MAX_SPI_BUFFER_SIZE,
+				MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+	}
+
+	if (buf && need_memset)
+		g_h.funcs->_h_memset(buf, 0, MAX_SPI_BUFFER_SIZE);
+
+	if (!buf) {
+		ESP_LOGE(TAG, "SPI DMA buffer malloc failed, largest internal DMA block=%u",
+				(unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+		return NULL;
+	}
+
+	if (buf && (!esp_ptr_internal(buf) || !esp_ptr_dma_capable(buf) ||
+			!esp_ptr_internal((uint8_t *)buf + MAX_SPI_BUFFER_SIZE - 1) ||
+			!esp_ptr_dma_capable((uint8_t *)buf + MAX_SPI_BUFFER_SIZE - 1) ||
+			((uintptr_t)buf & (HOSTED_MEM_ALIGNMENT_64 - 1)))) {
+		ESP_LOGE(TAG, "SPI buffer %p is not internal DMA-capable/aligned", buf);
+		spi_buffer_free(buf);
+		return NULL;
+	}
+
+	return buf;
 }
 
 static inline void spi_buffer_free(void *buf)
 {
-	MEMPOOL_FREE(buf_mp_g, buf);
+	if (!buf)
+		return;
+
+	portENTER_CRITICAL(&spi_dma_pool_lock);
+	for (uint8_t i = 0; i < spi_dma_pool_count; i++) {
+		if (buf == spi_dma_pool[i]) {
+			spi_dma_pool_in_use[i] = 0;
+			portEXIT_CRITICAL(&spi_dma_pool_lock);
+			return;
+		}
+	}
+	portEXIT_CRITICAL(&spi_dma_pool_lock);
+
+	heap_caps_free(buf);
 }
 
 
@@ -357,6 +430,11 @@ static int process_spi_rx_buf(uint8_t * rxbuff)
 	offset = le16toh(h->offset);
 	is_wakeup_pkt = h->flags & FLAG_WAKEUP_PKT;
 
+	if ((len == UINT16_MAX) && (offset == UINT16_MAX)) {
+		ret = -5;
+		goto done;
+	}
+
 	if (is_wakeup_pkt && len<1500) {
 		ESP_LOGW(TAG, "Host wakeup triggered, if_type: %u, len: %u ", h->if_type, len);
 		//ESP_HEXLOGW("Wakeup_pkt", rxbuff+offset, len, H_MIN(len, 128));
@@ -373,7 +451,7 @@ static int process_spi_rx_buf(uint8_t * rxbuff)
 
 	if ((len > MAX_PAYLOAD_SIZE) ||
 		(offset != sizeof(struct esp_payload_header))) {
-		ESP_LOGI(TAG, "rx packet ignored: len [%u], rcvd_offset[%u], exp_offset[%u]\n",
+		ESP_LOGD(TAG, "rx packet ignored: len [%u], rcvd_offset[%u], exp_offset[%u]",
 				len, offset, sizeof(struct esp_payload_header));
 
 		/* 1. no payload to process
@@ -482,7 +560,11 @@ static int check_and_execute_spi_transaction(void)
 				 * valid reset txbuff is needed for SPI driver
 				 */
 				txbuff = spi_buffer_alloc(MEMSET_REQUIRED);
-				assert(txbuff);
+				if (!txbuff) {
+					ESP_LOGE(TAG, "failed to allocate SPI dummy TX buffer");
+					ret = -1;
+					goto cleanup;
+				}
 
 				h = (struct esp_payload_header *) txbuff;
 				h->if_type = ESP_MAX_IF;
@@ -499,7 +581,11 @@ static int check_and_execute_spi_transaction(void)
 			ESP_LOGD(TAG, "dr %u tx_valid %u\n", gpio_rx_data_ready, is_valid_tx_buf);
 			/* Allocate rx buffer */
 			rxbuff = spi_buffer_alloc(MEMSET_REQUIRED);
-			assert(rxbuff);
+			if (!rxbuff) {
+				ESP_LOGE(TAG, "failed to allocate SPI RX buffer");
+				ret = -1;
+				goto cleanup;
+			}
 			//heap_caps_dump_all();
 #if H_MEM_STATS
 			h_stats_g.spi_mem_stats.rx_alloc++;
@@ -522,10 +608,19 @@ static int check_and_execute_spi_transaction(void)
 			 */
 			ret = g_h.funcs->_h_do_bus_transfer(&spi_trans);
 
-			if (!ret)
+			if (!ret) {
 				process_spi_rx_buf(spi_trans.rx_buf);
+				rxbuff = NULL;
+			} else if (rxbuff) {
+				spi_buffer_free(rxbuff);
+				rxbuff = NULL;
+#if H_MEM_STATS
+				h_stats_g.spi_mem_stats.rx_freed++;
+#endif
+			}
 		}
 
+cleanup:
 		if (txbuff && tx_buff_free_func) {
 			tx_buff_free_func(txbuff);
 #if H_MEM_STATS
@@ -777,6 +872,7 @@ static uint8_t * get_next_tx_buffer(uint8_t *is_valid_tx_buf, void (**free_func)
 	struct  esp_payload_header *payload_header;
 	uint8_t *sendbuf = NULL;
 	uint8_t *payload = NULL;
+	uint8_t *payload_src = NULL;
 	uint16_t len = 0;
 	interface_buffer_handle_t buf_handle = {0};
 	uint8_t tx_needed = 1;
@@ -814,23 +910,20 @@ static uint8_t * get_next_tx_buffer(uint8_t *is_valid_tx_buf, void (**free_func)
 
 		ESP_HEXLOGD("h_spi_tx", buf_handle.payload, len, 16);
 
-		if (!buf_handle.payload_zcopy) {
-			sendbuf = spi_buffer_alloc(MEMSET_REQUIRED);
-			assert(sendbuf);
-#if H_MEM_STATS
-			h_stats_g.spi_mem_stats.tx_alloc++;
-#endif
-			*free_func = spi_buffer_free;
-		} else {
-			sendbuf = buf_handle.payload;
-			*free_func = buf_handle.free_buf_handle;
-		}
-
+		sendbuf = spi_buffer_alloc(MEMSET_REQUIRED);
 		if (!sendbuf) {
 			ESP_LOGE(TAG, "spi buff malloc failed");
+			*is_valid_tx_buf = 0;
 			*free_func = NULL;
 			goto done;
 		}
+#if H_MEM_STATS
+		h_stats_g.spi_mem_stats.tx_alloc++;
+#endif
+		*free_func = spi_buffer_free;
+		payload_src = buf_handle.payload;
+		if (payload_src && buf_handle.payload_zcopy)
+			payload_src += sizeof(struct esp_payload_header);
 
 		/* Form Tx header */
 		payload_header = (struct esp_payload_header *) sendbuf;
@@ -843,18 +936,19 @@ static uint8_t * get_next_tx_buffer(uint8_t *is_valid_tx_buf, void (**free_func)
 
 		if (payload_header->if_type == ESP_HCI_IF) {
 			// special handling for HCI
-			if (!buf_handle.payload_zcopy) {
+			if (payload_src && len) {
 				// copy first byte of payload into header
-				payload_header->hci_pkt_type = buf_handle.payload[0];
+				payload_header->hci_pkt_type = payload_src[0];
 				// adjust actual payload len
 				len -= 1;
 				payload_header->len = htole16(len);
-				g_h.funcs->_h_memcpy(payload, &buf_handle.payload[1], len);
+				if (len)
+					g_h.funcs->_h_memcpy(payload, &payload_src[1], len);
 			}
 		} else {
 			/* Non HCI packets */
-			if (!buf_handle.payload_zcopy && len)
-				g_h.funcs->_h_memcpy(payload, buf_handle.payload, H_MIN(len, MAX_PAYLOAD_SIZE));
+			if (payload_src && len)
+				g_h.funcs->_h_memcpy(payload, payload_src, H_MIN(len, MAX_PAYLOAD_SIZE));
 		}
 
 		//TODO: checksum should be configurable from menuconfig
@@ -863,8 +957,9 @@ static uint8_t * get_next_tx_buffer(uint8_t *is_valid_tx_buf, void (**free_func)
 	}
 
 done:
-	if (len && !buf_handle.payload_zcopy) {
-		/* free allocated buffer, only if zerocopy is not requested */
+	if ((buf_handle.payload_len || buf_handle.flag) &&
+			buf_handle.free_buf_handle && buf_handle.priv_buffer_handle) {
+		/* free queued upper-layer buffer after copying it into SPI DMA memory */
 		H_FREE_PTR_WITH_FUNC(buf_handle.free_buf_handle, buf_handle.priv_buffer_handle);
 #if H_MEM_STATS
 		if (buf_handle.free_buf_handle &&
@@ -960,7 +1055,10 @@ int bus_inform_slave_host_power_save_start(void)
 
 		/* Create tx buffer with power save flag */
 		txbuff = spi_buffer_alloc(MEMSET_REQUIRED);
-		assert(txbuff);
+		if (!txbuff) {
+			ESP_LOGE(TAG, "failed to allocate power-save start TX buffer");
+			return ESP_ERR_NO_MEM;
+		}
 
 		h = (struct esp_payload_header *) txbuff;
 		h->if_type = ESP_SERIAL_IF;
@@ -972,7 +1070,11 @@ int bus_inform_slave_host_power_save_start(void)
 
 		/* Allocate rx buffer for transaction */
 		rxbuff = spi_buffer_alloc(MEMSET_REQUIRED);
-		assert(rxbuff);
+		if (!rxbuff) {
+			ESP_LOGE(TAG, "failed to allocate power-save start RX buffer");
+			spi_buffer_free(txbuff);
+			return ESP_ERR_NO_MEM;
+		}
 
 		/* Set up SPI transaction */
 		spi_trans.tx_buf = txbuff;
@@ -988,6 +1090,8 @@ int bus_inform_slave_host_power_save_start(void)
 		spi_buffer_free(txbuff);
 		if (!ret) {
 			process_spi_rx_buf(spi_trans.rx_buf);
+		} else {
+			spi_buffer_free(rxbuff);
 		}
 	} else {
 		/* Use normal queue mechanism */
@@ -1018,7 +1122,10 @@ int bus_inform_slave_host_power_save_stop(void)
 
 		/* Create tx buffer with power save flag */
 		txbuff = spi_buffer_alloc(MEMSET_REQUIRED);
-		assert(txbuff);
+		if (!txbuff) {
+			ESP_LOGE(TAG, "failed to allocate power-save stop TX buffer");
+			return ESP_ERR_NO_MEM;
+		}
 
 		h = (struct esp_payload_header *) txbuff;
 		h->if_type = ESP_SERIAL_IF;
@@ -1030,7 +1137,11 @@ int bus_inform_slave_host_power_save_stop(void)
 
 		/* Allocate rx buffer for transaction */
 		rxbuff = spi_buffer_alloc(MEMSET_REQUIRED);
-		assert(rxbuff);
+		if (!rxbuff) {
+			ESP_LOGE(TAG, "failed to allocate power-save stop RX buffer");
+			spi_buffer_free(txbuff);
+			return ESP_ERR_NO_MEM;
+		}
 
 		/* Set up SPI transaction */
 		spi_trans.tx_buf = txbuff;
@@ -1046,6 +1157,8 @@ int bus_inform_slave_host_power_save_stop(void)
 		spi_buffer_free(txbuff);
 		if (!ret) {
 			process_spi_rx_buf(spi_trans.rx_buf);
+		} else {
+			spi_buffer_free(rxbuff);
 		}
 	} else {
 		/* Use normal queue mechanism */

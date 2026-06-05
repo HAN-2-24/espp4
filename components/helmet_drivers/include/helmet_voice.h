@@ -43,6 +43,18 @@ esp_err_t helmet_voice_play_alert(helmet_voice_alert_t alert);
 esp_err_t helmet_voice_stop(void);
 
 /*
+ * Play raw PCM chunks from a cloud response.
+ *
+ * Format:
+ *   16000 Hz
+ *   16-bit signed little-endian PCM
+ *   mono
+ */
+esp_err_t helmet_voice_stream_pcm_begin(void);
+esp_err_t helmet_voice_stream_pcm_write(const void *pcm, size_t bytes);
+esp_err_t helmet_voice_stream_pcm_end(void);
+
+/*
  * 读取麦克风 PCM。
  *
  * 输出格式：

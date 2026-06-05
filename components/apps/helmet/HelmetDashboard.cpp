@@ -11,15 +11,14 @@
 #include "helmet_voice.h"
 #include "helmet_vision.h"
 #include "helmet_cloud.h"
-#include "helmet_wifi.h"
 #include "ui/ui_helmet.h"
 
 static const char *TAG = "HelmetDashboard";
 
-LV_IMG_DECLARE(img_app_setting);
+LV_IMG_DECLARE(img_app_helmet);
 
 HelmetDashboard::HelmetDashboard():
-    ESP_Brookesia_PhoneApp("Helmet", &img_app_setting, false),
+    ESP_Brookesia_PhoneApp("Helmet", &img_app_helmet, false),
     _is_ui_del(true),
     _is_ui_resumed(false),
     _timer(nullptr)

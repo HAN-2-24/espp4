@@ -63,6 +63,7 @@ typedef struct {
     helmet_cloud_state_t cloud;
 
     bool alarm_active;
+    bool alarm_suppressed;
     bool voice_enabled;
     bool cloud_enabled;
 

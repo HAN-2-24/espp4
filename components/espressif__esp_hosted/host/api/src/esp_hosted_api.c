@@ -31,9 +31,18 @@ static const char *TAG="H_API";
 static uint8_t esp_hosted_init_done;
 static uint8_t esp_hosted_transport_up;
 
+static void transport_active_cb(void);
+
+static inline void sync_transport_up_from_driver(void)
+{
+	if (!esp_hosted_transport_up && is_transport_tx_ready()) {
+		transport_active_cb();
+	}
+}
 
 #define check_transport_up()                                                    \
     do {                                                                        \
+        sync_transport_up_from_driver();                                        \
         if (!(esp_hosted_transport_up)) {                                       \
             ESP_LOGE(TAG, "ESP-Hosted link not yet up");                        \
             return ESP_FAIL;                                                    \
@@ -54,6 +63,9 @@ struct esp_remote_channel {
 /** Exported Functions **/
 static void transport_active_cb(void)
 {
+	if (esp_hosted_transport_up)
+		return;
+
 	ESP_LOGI(TAG, "Transport active");
 	esp_hosted_transport_up = 1;
 	g_h.funcs->_h_event_post(ESP_HOSTED_EVENT,
@@ -176,14 +188,17 @@ static inline esp_err_t esp_hosted_reconfigure(void)
 		return ESP_FAIL;
 	}
 
-	ESP_ERROR_CHECK_WITHOUT_ABORT(transport_drv_reconfigure());
-	return ESP_OK;
+	return transport_drv_reconfigure();
 }
 
 int esp_hosted_connect_to_slave(void)
 {
 	ESP_LOGI(TAG, "ESP-Hosted Try to communicate with ESP-Hosted slave\n");
-	return esp_hosted_reconfigure();
+	esp_err_t ret = esp_hosted_reconfigure();
+	if (ret == ESP_OK) {
+		sync_transport_up_from_driver();
+	}
+	return ret;
 }
 
 esp_remote_channel_t esp_hosted_add_channel(esp_remote_channel_config_t config,
@@ -220,7 +235,10 @@ esp_err_t esp_hosted_remove_channel(esp_remote_channel_t eh_chan)
 
 esp_err_t esp_wifi_remote_init(const wifi_init_config_t *arg)
 {
-	ESP_ERROR_CHECK_WITHOUT_ABORT(esp_hosted_reconfigure());
+	esp_err_t ret = esp_hosted_reconfigure();
+	if (ret != ESP_OK) {
+		return ret;
+	}
 	check_transport_up();
 	return rpc_wifi_init(arg);
 }

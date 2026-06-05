@@ -23,6 +23,16 @@ static void unlock_state(void)
     }
 }
 
+static bool has_alarm_source_locked(void)
+{
+    bool danger = s_state.pose.valid &&
+                  (s_state.pose.fall_detected || s_state.pose.impact_detected);
+    bool fatigue = s_state.eye.valid &&
+                   (s_state.eye.perclos >= 0.45f || s_state.eye.yawn_detected);
+
+    return danger || fatigue;
+}
+
 const char *helmet_risk_to_string(helmet_risk_level_t risk)
 {
     switch (risk) {
@@ -135,6 +145,7 @@ void helmet_state_set_cloud(helmet_cloud_state_t cloud)
 void helmet_state_request_alarm(void)
 {
     lock_state();
+    s_state.alarm_suppressed = false;
     s_state.alarm_active = true;
     unlock_state();
 }
@@ -143,6 +154,7 @@ void helmet_state_cancel_alarm(void)
 {
     lock_state();
     s_state.alarm_active = false;
+    s_state.alarm_suppressed = has_alarm_source_locked();
     unlock_state();
 }
 
@@ -151,17 +163,24 @@ void helmet_state_update_fusion(void)
     lock_state();
 
     helmet_risk_level_t risk = HELMET_RISK_NORMAL;
+    bool alarm_source = false;
 
     if (s_state.pose.valid && (s_state.pose.fall_detected || s_state.pose.impact_detected)) {
         risk = HELMET_RISK_DANGER;
-        s_state.alarm_active = true;
+        alarm_source = true;
     } else if (s_state.eye.valid && (s_state.eye.perclos >= 0.45f || s_state.eye.yawn_detected)) {
         risk = HELMET_RISK_FATIGUE;
-        s_state.alarm_active = true;
+        alarm_source = true;
     } else if (s_state.eye.valid && s_state.eye.perclos >= 0.25f) {
         risk = HELMET_RISK_ATTENTION;
     } else if (s_state.pose.valid && (s_state.pose.roll >= 45.0f || s_state.pose.roll <= -45.0f)) {
         risk = HELMET_RISK_ATTENTION;
+    }
+
+    if (!alarm_source) {
+        s_state.alarm_suppressed = false;
+    } else if (!s_state.alarm_suppressed) {
+        s_state.alarm_active = true;
     }
 
     s_state.risk = risk;
