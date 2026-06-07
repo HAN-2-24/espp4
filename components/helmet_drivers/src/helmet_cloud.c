@@ -9,7 +9,6 @@
 #include "sdkconfig.h"
 #include "esp_event.h"
 #include "esp_err.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -80,12 +79,17 @@ static volatile bool s_cloud_wifi_connected = false;
 static volatile bool s_mqtt_connected = false;
 static volatile uint32_t s_status_request_id = 0;
 static volatile uint32_t s_status_pcm_expected_seq = 0;
+static volatile bool s_status_request_queued = false;
 static volatile bool s_status_request_pending = false;
 static volatile bool s_status_pcm_stream_open = false;
 static char s_cloud_ip_string[16] = "0.0.0.0";
+static char s_cloud_state_payload[HELMET_CLOUD_STATE_PAYLOAD_SIZE];
+static char s_cloud_status_payload[HELMET_CLOUD_STATUS_PAYLOAD_SIZE];
 static EventGroupHandle_t s_cloud_wifi_event_group = NULL;
 static esp_event_handler_instance_t s_cloud_wifi_any_id_handler;
 static esp_event_handler_instance_t s_cloud_wifi_got_ip_handler;
+
+static esp_err_t helmet_cloud_publish_status_pcm_request(void);
 
 static const char *json_bool(bool value)
 {
@@ -108,16 +112,6 @@ static void helmet_cloud_log_unconfigured_once(void)
         ESP_LOGW(TAG, "MQTT broker URI is not configured. Set CONFIG_HELMET_MQTT_URI.");
         s_mqtt_config_warned = true;
     }
-}
-
-static void *helmet_cloud_alloc(size_t size)
-{
-    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (ptr == NULL) {
-        ptr = heap_caps_malloc(size, MALLOC_CAP_8BIT);
-    }
-
-    return ptr;
 }
 
 static void helmet_cloud_wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -560,22 +554,16 @@ static esp_err_t helmet_cloud_publish_state_once(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    char *payload = helmet_cloud_alloc(HELMET_CLOUD_STATE_PAYLOAD_SIZE);
-    if (payload == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    esp_err_t ret = helmet_cloud_build_payload(payload, HELMET_CLOUD_STATE_PAYLOAD_SIZE);
+    esp_err_t ret = helmet_cloud_build_payload(s_cloud_state_payload, sizeof(s_cloud_state_payload));
     if (ret != ESP_OK) {
-        free(payload);
         return ret;
     }
 
-    int payload_len = (int)strlen(payload);
+    int payload_len = (int)strlen(s_cloud_state_payload);
     int msg_id = esp_mqtt_client_publish(
         s_mqtt_client,
         HELMET_MQTT_TOPIC_ATTR,
-        payload,
+        s_cloud_state_payload,
         payload_len,
         0,
         0
@@ -590,8 +578,6 @@ static esp_err_t helmet_cloud_publish_state_once(void)
         payload_len
     );
 #endif
-
-    free(payload);
 
     if (msg_id < 0) {
         return ESP_FAIL;
@@ -904,9 +890,18 @@ static void helmet_cloud_task(void *arg)
             continue;
         }
 
-        helmet_cloud_publish_state_once();
+        if (s_status_request_queued) {
+            s_status_request_queued = false;
 
-        vTaskDelay(pdMS_TO_TICKS(HELMET_CLOUD_REPORT_INTERVAL_MS));
+            esp_err_t request_ret = helmet_cloud_publish_status_pcm_request();
+            if (request_ret != ESP_OK) {
+                ESP_LOGW(TAG, "status pcm request failed: %s", esp_err_to_name(request_ret));
+            }
+        } else {
+            helmet_cloud_publish_state_once();
+        }
+
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(HELMET_CLOUD_REPORT_INTERVAL_MS));
     }
 }
 
@@ -964,6 +959,99 @@ esp_err_t helmet_cloud_update_once(void)
     return helmet_cloud_publish_state_once();
 }
 
+static esp_err_t helmet_cloud_publish_status_pcm_request(void)
+{
+    if (!helmet_cloud_mqtt_is_configured()) {
+        helmet_cloud_log_unconfigured_once();
+        helmet_state_set_cloud(HELMET_CLOUD_OFFLINE);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!helmet_cloud_wifi_is_connected()) {
+        helmet_state_set_cloud(HELMET_CLOUD_OFFLINE);
+        ESP_LOGW(TAG, "status pcm request skipped: WiFi offline");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_mqtt_client == NULL || !s_mqtt_started || !s_mqtt_connected) {
+        ESP_LOGW(TAG, "status pcm request skipped: MQTT offline");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    helmet_cloud_close_status_stream();
+
+    s_status_request_id++;
+    if (s_status_request_id == 0) {
+        s_status_request_id = 1;
+    }
+
+    s_status_request_pending = true;
+    s_status_pcm_expected_seq = 0;
+
+    int prefix_len = snprintf(
+        s_cloud_status_payload,
+        sizeof(s_cloud_status_payload),
+        "{"
+            "\"type\":\"helmet_status_query\","
+            "\"request_id\":%lu,"
+            "\"audio\":{"
+                "\"format\":\"pcm_s16le\","
+                "\"sample_rate\":16000,"
+                "\"channels\":1"
+            "},"
+            "\"state\":",
+        (unsigned long)s_status_request_id
+    );
+
+    if (prefix_len <= 0 || prefix_len >= ((int)sizeof(s_cloud_status_payload) - 2)) {
+        s_status_request_pending = false;
+        ESP_LOGE(TAG, "status pcm request payload too long");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    size_t state_capacity = sizeof(s_cloud_status_payload) - (size_t)prefix_len - 1;
+    esp_err_t ret = helmet_cloud_build_payload(s_cloud_status_payload + prefix_len, state_capacity);
+    if (ret != ESP_OK) {
+        s_status_request_pending = false;
+        return ret;
+    }
+
+    size_t state_len = strlen(s_cloud_status_payload + prefix_len);
+    size_t len = (size_t)prefix_len + state_len;
+    if (len + 1 >= sizeof(s_cloud_status_payload)) {
+        s_status_request_pending = false;
+        ESP_LOGE(TAG, "status pcm request payload too long");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    s_cloud_status_payload[len++] = '}';
+    s_cloud_status_payload[len] = '\0';
+
+    int msg_id = esp_mqtt_client_publish(
+        s_mqtt_client,
+        HELMET_MQTT_TOPIC_STATUS_QUERY,
+        s_cloud_status_payload,
+        (int)len,
+        0,
+        0
+    );
+
+    if (msg_id < 0) {
+        s_status_request_pending = false;
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "status pcm request msg_id=%d request=%lu topic=%s",
+        msg_id,
+        (unsigned long)s_status_request_id,
+        HELMET_MQTT_TOPIC_STATUS_QUERY
+    );
+
+    return ESP_OK;
+}
+
 esp_err_t helmet_cloud_request_status_pcm(void)
 {
     if (!helmet_cloud_mqtt_is_configured()) {
@@ -983,83 +1071,13 @@ esp_err_t helmet_cloud_request_status_pcm(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    char *state_payload = helmet_cloud_alloc(HELMET_CLOUD_STATE_PAYLOAD_SIZE);
-    if (state_payload == NULL) {
-        return ESP_ERR_NO_MEM;
+    s_status_request_queued = true;
+
+    if (s_cloud_task_handle != NULL) {
+        xTaskNotifyGive(s_cloud_task_handle);
     }
 
-    esp_err_t ret = helmet_cloud_build_payload(state_payload, HELMET_CLOUD_STATE_PAYLOAD_SIZE);
-    if (ret != ESP_OK) {
-        free(state_payload);
-        return ret;
-    }
-
-    helmet_cloud_close_status_stream();
-
-    s_status_request_id++;
-    if (s_status_request_id == 0) {
-        s_status_request_id = 1;
-    }
-
-    s_status_request_pending = true;
-    s_status_pcm_expected_seq = 0;
-
-    char *payload = helmet_cloud_alloc(HELMET_CLOUD_STATUS_PAYLOAD_SIZE);
-    if (payload == NULL) {
-        free(state_payload);
-        s_status_request_pending = false;
-        return ESP_ERR_NO_MEM;
-    }
-
-    int len = snprintf(
-        payload,
-        HELMET_CLOUD_STATUS_PAYLOAD_SIZE,
-        "{"
-            "\"type\":\"helmet_status_query\","
-            "\"request_id\":%lu,"
-            "\"audio\":{"
-                "\"format\":\"pcm_s16le\","
-                "\"sample_rate\":16000,"
-                "\"channels\":1"
-            "},"
-            "\"state\":%s"
-        "}",
-        (unsigned long)s_status_request_id,
-        state_payload
-    );
-
-    if (len <= 0 || len >= HELMET_CLOUD_STATUS_PAYLOAD_SIZE) {
-        free(payload);
-        free(state_payload);
-        s_status_request_pending = false;
-        ESP_LOGE(TAG, "status pcm request payload too long");
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    int msg_id = esp_mqtt_client_publish(
-        s_mqtt_client,
-        HELMET_MQTT_TOPIC_STATUS_QUERY,
-        payload,
-        len,
-        0,
-        0
-    );
-
-    free(payload);
-    free(state_payload);
-
-    if (msg_id < 0) {
-        s_status_request_pending = false;
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(
-        TAG,
-        "status pcm request msg_id=%d request=%lu topic=%s",
-        msg_id,
-        (unsigned long)s_status_request_id,
-        HELMET_MQTT_TOPIC_STATUS_QUERY
-    );
+    ESP_LOGI(TAG, "status pcm request queued");
 
     return ESP_OK;
 }

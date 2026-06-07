@@ -50,7 +50,7 @@ static esp_codec_dev_handle_t s_mic_codec = NULL;
 #define VOICE_CAPTURE_INTERVAL_MS         20
 
 #define VOICE_MN_TIMEOUT_MS               6000
-#define VOICE_MN_DET_THRESHOLD            0.45f
+#define VOICE_MN_DET_THRESHOLD            0.35f
 #define VOICE_CMD_COOLDOWN_MS             1500
 
 #define VOICE_LOG_EVERY_N_FRAMES          500
@@ -60,10 +60,6 @@ static esp_codec_dev_handle_t s_mic_codec = NULL;
 #define VOICE_ALERT_NONE                  (-1)
 #define VOICE_MN_CANCEL_ID                HELMET_VOICE_CMD_CANCEL_ALARM
 #define VOICE_MN_STATUS_ID                HELMET_VOICE_CMD_REPORT_STATUS
-#define VOICE_CMD_CANCEL_TEXT             "取消警报"
-#define VOICE_CMD_CANCEL_PINYIN           "qu xiao jing bao"
-#define VOICE_CMD_STATUS_TEXT             "状态查询"
-#define VOICE_CMD_STATUS_PINYIN           "zhuang tai cha xun"
 
 static int16_t s_capture_pcm[VOICE_CAPTURE_FRAMES];
 
@@ -131,22 +127,6 @@ static void helmet_multinet_clean(void)
     }
 }
 
-static bool voice_mn_result_matches(
-    const esp_mn_results_t *results,
-    const char *text,
-    const char *pinyin
-)
-{
-    if (results == NULL) {
-        return false;
-    }
-
-    return strstr(results->string, text) != NULL ||
-           strstr(results->raw_string, text) != NULL ||
-           strstr(results->string, pinyin) != NULL ||
-           strstr(results->raw_string, pinyin) != NULL;
-}
-
 static esp_err_t helmet_multinet_init(srmodel_list_t *models)
 {
     if (models == NULL) {
@@ -193,7 +173,7 @@ static esp_err_t helmet_multinet_init(srmodel_list_t *models)
 
     ESP_LOGI(
         TAG,
-        "MultiNet ready: model=%s chunksize=%d sample_rate=%d commands=offline cancel_id=%d status_id=%d loader=%s no_runtime_commands=1 threshold=%.2f",
+        "MultiNet ready: model=%s chunksize=%d sample_rate=%d commands=offline cancel_id=%d status_id=%d loader=%s threshold=%.2f",
         mn_name,
         s_mn_chunksize,
         sample_rate,
@@ -246,11 +226,9 @@ static helmet_voice_cmd_t helmet_multinet_detect_command(
     int command_id = results->command_id[0];
     helmet_voice_cmd_t cmd = HELMET_VOICE_CMD_UNKNOWN;
 
-    if (command_id == VOICE_MN_CANCEL_ID &&
-        voice_mn_result_matches(results, VOICE_CMD_CANCEL_TEXT, VOICE_CMD_CANCEL_PINYIN)) {
+    if (command_id == VOICE_MN_CANCEL_ID) {
         cmd = HELMET_VOICE_CMD_CANCEL_ALARM;
-    } else if (command_id == VOICE_MN_STATUS_ID &&
-               voice_mn_result_matches(results, VOICE_CMD_STATUS_TEXT, VOICE_CMD_STATUS_PINYIN)) {
+    } else if (command_id == VOICE_MN_STATUS_ID) {
         cmd = HELMET_VOICE_CMD_REPORT_STATUS;
     }
 
