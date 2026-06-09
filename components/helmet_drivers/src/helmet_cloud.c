@@ -58,6 +58,19 @@ static const char *TAG = "helmet_cloud";
 #define HELMET_CLOUD_MQTT_OUTBOX_LIMIT    1024
 #define HELMET_CLOUD_MQTT_TASK_STACK_SIZE 4096
 #define HELMET_CLOUD_PCM_FLAG_FINAL       0x01U
+#define HELMET_CLOUD_PCM_FLAG_ADPCM       0x02U
+#define HELMET_CLOUD_STATUS_PCM_QOS       0
+#define HELMET_CLOUD_STATUS_PCM_IDLE_TIMEOUT_MS 2500
+#define HELMET_CLOUD_STATUS_PCM_RESPONSE_TIMEOUT_MS 15000
+#define HELMET_CLOUD_ADPCM_DECODE_BYTES   256
+#define HELMET_CLOUD_ADPCM_DECODE_SAMPLES (HELMET_CLOUD_ADPCM_DECODE_BYTES * 2)
+#ifdef CONFIG_BSP_SPIFFS_MOUNT_POINT
+#define HELMET_CLOUD_STATUS_PCM_FILE_PATH CONFIG_BSP_SPIFFS_MOUNT_POINT "/status_reply.pcm"
+#else
+#define HELMET_CLOUD_STATUS_PCM_FILE_PATH "/spiffs/status_reply.pcm"
+#endif
+#define HELMET_CLOUD_STATUS_PCM_FILE_IO_BYTES 512
+#define HELMET_CLOUD_STATUS_PCM_MAX_BYTES (256U * 1024U)
 
 #if CONFIG_HELMET_MQTT_USE_EMBEDDED_CA
 extern const uint8_t emqx_ca_pem_start[] asm("_binary_emqx_ca_pem_start");
@@ -82,9 +95,20 @@ static volatile uint32_t s_status_pcm_expected_seq = 0;
 static volatile bool s_status_request_queued = false;
 static volatile bool s_status_request_pending = false;
 static volatile bool s_status_pcm_stream_open = false;
+static volatile bool s_status_pcm_play_queued = false;
+static bool s_status_pcm_stream_adpcm = false;
+static volatile TickType_t s_status_request_tick = 0;
+static volatile TickType_t s_status_pcm_last_tick = 0;
+static volatile uint32_t s_status_pcm_play_request_id = 0;
 static char s_cloud_ip_string[16] = "0.0.0.0";
 static char s_cloud_state_payload[HELMET_CLOUD_STATE_PAYLOAD_SIZE];
 static char s_cloud_status_payload[HELMET_CLOUD_STATUS_PAYLOAD_SIZE];
+static FILE *s_status_pcm_file = NULL;
+static size_t s_status_pcm_file_bytes = 0;
+static int16_t s_status_adpcm_decode_pcm[HELMET_CLOUD_ADPCM_DECODE_SAMPLES];
+static uint8_t s_status_pcm_file_io_buf[HELMET_CLOUD_STATUS_PCM_FILE_IO_BYTES];
+static int s_status_adpcm_predictor = 0;
+static int s_status_adpcm_index = 0;
 static EventGroupHandle_t s_cloud_wifi_event_group = NULL;
 static esp_event_handler_instance_t s_cloud_wifi_any_id_handler;
 static esp_event_handler_instance_t s_cloud_wifi_got_ip_handler;
@@ -651,12 +675,284 @@ static bool helmet_cloud_parse_pcm_topic(
     return true;
 }
 
+static void helmet_cloud_status_file_close(void)
+{
+    if (s_status_pcm_file != NULL) {
+        fclose(s_status_pcm_file);
+        s_status_pcm_file = NULL;
+    }
+}
+
+static esp_err_t helmet_cloud_status_file_open(uint32_t request_id)
+{
+    helmet_cloud_status_file_close();
+    remove(HELMET_CLOUD_STATUS_PCM_FILE_PATH);
+
+    s_status_pcm_file = fopen(HELMET_CLOUD_STATUS_PCM_FILE_PATH, "wb");
+    s_status_pcm_file_bytes = 0;
+
+    if (s_status_pcm_file == NULL) {
+        ESP_LOGW(TAG, "status pcm file open failed request=%lu path=%s",
+                 (unsigned long)request_id, HELMET_CLOUD_STATUS_PCM_FILE_PATH);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "status pcm file begin request=%lu path=%s",
+             (unsigned long)request_id, HELMET_CLOUD_STATUS_PCM_FILE_PATH);
+
+    return ESP_OK;
+}
+
+static esp_err_t helmet_cloud_status_file_write(const void *data, size_t bytes)
+{
+    if (bytes == 0) {
+        return ESP_OK;
+    }
+
+    if (data == NULL || s_status_pcm_file == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_status_pcm_file_bytes + bytes > HELMET_CLOUD_STATUS_PCM_MAX_BYTES) {
+        ESP_LOGW(TAG, "status pcm file too large: %u + %u",
+                 (unsigned)s_status_pcm_file_bytes, (unsigned)bytes);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t written = fwrite(data, 1, bytes, s_status_pcm_file);
+    if (written != bytes) {
+        ESP_LOGW(TAG, "status pcm file write failed: %u/%u",
+                 (unsigned)written, (unsigned)bytes);
+        return ESP_FAIL;
+    }
+
+    s_status_pcm_file_bytes += written;
+
+    return ESP_OK;
+}
+
+static esp_err_t helmet_cloud_play_status_pcm_file(uint32_t request_id)
+{
+    FILE *file = fopen(HELMET_CLOUD_STATUS_PCM_FILE_PATH, "rb");
+    if (file == NULL) {
+        ESP_LOGW(TAG, "status pcm playback open failed request=%lu path=%s",
+                 (unsigned long)request_id, HELMET_CLOUD_STATUS_PCM_FILE_PATH);
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = helmet_voice_stream_pcm_begin();
+    if (ret != ESP_OK) {
+        fclose(file);
+        ESP_LOGW(TAG, "status pcm playback begin failed request=%lu ret=%s",
+                 (unsigned long)request_id, esp_err_to_name(ret));
+        return ret;
+    }
+
+    size_t total = 0;
+
+    while (true) {
+        size_t bytes_read = fread(
+            s_status_pcm_file_io_buf,
+            1,
+            sizeof(s_status_pcm_file_io_buf),
+            file
+        );
+
+        if (bytes_read == 0) {
+            if (!feof(file)) {
+                ret = ESP_FAIL;
+            }
+            break;
+        }
+
+        if ((bytes_read & 1U) != 0U) {
+            bytes_read--;
+        }
+
+        if (bytes_read == 0) {
+            continue;
+        }
+
+        ret = helmet_voice_stream_pcm_write(s_status_pcm_file_io_buf, bytes_read);
+        if (ret != ESP_OK) {
+            break;
+        }
+
+        total += bytes_read;
+    }
+
+    esp_err_t end_ret = helmet_voice_stream_pcm_end();
+    fclose(file);
+    remove(HELMET_CLOUD_STATUS_PCM_FILE_PATH);
+
+    if (ret == ESP_OK) {
+        ret = end_ret;
+    }
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "status pcm playback done request=%lu bytes=%u",
+                 (unsigned long)request_id, (unsigned)total);
+    } else {
+        ESP_LOGW(TAG, "status pcm playback failed request=%lu ret=%s bytes=%u",
+                 (unsigned long)request_id, esp_err_to_name(ret), (unsigned)total);
+    }
+
+    return ret;
+}
+
+static void helmet_cloud_service_status_pcm_playback(void)
+{
+    if (!s_status_pcm_play_queued) {
+        return;
+    }
+
+    uint32_t request_id = s_status_pcm_play_request_id;
+    s_status_pcm_play_queued = false;
+    s_status_pcm_play_request_id = 0;
+
+    (void)helmet_cloud_play_status_pcm_file(request_id);
+}
+
+static void helmet_cloud_adpcm_reset(void)
+{
+    s_status_adpcm_predictor = 0;
+    s_status_adpcm_index = 0;
+}
+
+static int16_t helmet_cloud_adpcm_decode_nibble(uint8_t nibble)
+{
+    static const int index_table[16] = {
+        -1, -1, -1, -1, 2, 4, 6, 8,
+        -1, -1, -1, -1, 2, 4, 6, 8,
+    };
+    static const int step_table[89] = {
+        7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+        19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+        50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+        130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+        337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+        876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+        2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+        5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+        15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+    };
+
+    int step = step_table[s_status_adpcm_index];
+    int diff = step >> 3;
+
+    if ((nibble & 0x01U) != 0U) {
+        diff += step >> 2;
+    }
+    if ((nibble & 0x02U) != 0U) {
+        diff += step >> 1;
+    }
+    if ((nibble & 0x04U) != 0U) {
+        diff += step;
+    }
+
+    if ((nibble & 0x08U) != 0U) {
+        s_status_adpcm_predictor -= diff;
+    } else {
+        s_status_adpcm_predictor += diff;
+    }
+
+    if (s_status_adpcm_predictor > 32767) {
+        s_status_adpcm_predictor = 32767;
+    } else if (s_status_adpcm_predictor < -32768) {
+        s_status_adpcm_predictor = -32768;
+    }
+
+    s_status_adpcm_index += index_table[nibble & 0x0FU];
+    if (s_status_adpcm_index < 0) {
+        s_status_adpcm_index = 0;
+    } else if (s_status_adpcm_index > 88) {
+        s_status_adpcm_index = 88;
+    }
+
+    return (int16_t)s_status_adpcm_predictor;
+}
+
+static esp_err_t helmet_cloud_write_status_adpcm(const uint8_t *data, size_t bytes)
+{
+    if (data == NULL || bytes == 0) {
+        return ESP_OK;
+    }
+
+    size_t offset = 0;
+    while (offset < bytes) {
+        size_t block = bytes - offset;
+        if (block > HELMET_CLOUD_ADPCM_DECODE_BYTES) {
+            block = HELMET_CLOUD_ADPCM_DECODE_BYTES;
+        }
+
+        for (size_t i = 0; i < block; i++) {
+            uint8_t packed = data[offset + i];
+            s_status_adpcm_decode_pcm[i * 2] = helmet_cloud_adpcm_decode_nibble(packed & 0x0FU);
+            s_status_adpcm_decode_pcm[i * 2 + 1] = helmet_cloud_adpcm_decode_nibble((packed >> 4) & 0x0FU);
+        }
+
+        esp_err_t ret = helmet_cloud_status_file_write(
+            s_status_adpcm_decode_pcm,
+            block * 2U * sizeof(int16_t)
+        );
+
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        offset += block;
+    }
+
+    return ESP_OK;
+}
+
 static void helmet_cloud_close_status_stream(void)
 {
     if (s_status_pcm_stream_open) {
-        helmet_voice_stream_pcm_end();
+        helmet_cloud_status_file_close();
         s_status_pcm_stream_open = false;
+        s_status_pcm_stream_adpcm = false;
+        helmet_cloud_adpcm_reset();
     }
+}
+
+static void helmet_cloud_service_status_pcm_timeout(void)
+{
+    if (!s_status_request_pending) {
+        return;
+    }
+
+    if (!s_status_pcm_stream_open) {
+        if (s_status_request_tick == 0) {
+            return;
+        }
+
+        TickType_t elapsed = xTaskGetTickCount() - s_status_request_tick;
+        if (elapsed < pdMS_TO_TICKS(HELMET_CLOUD_STATUS_PCM_RESPONSE_TIMEOUT_MS)) {
+            return;
+        }
+
+        ESP_LOGW(TAG, "status pcm response timeout request=%lu", (unsigned long)s_status_request_id);
+        s_status_request_pending = false;
+        s_status_request_tick = 0;
+        s_status_pcm_last_tick = 0;
+        return;
+    }
+
+    if (s_status_pcm_last_tick == 0) {
+        return;
+    }
+
+    TickType_t elapsed = xTaskGetTickCount() - s_status_pcm_last_tick;
+    if (elapsed < pdMS_TO_TICKS(HELMET_CLOUD_STATUS_PCM_IDLE_TIMEOUT_MS)) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "status pcm idle timeout, closing stream request=%lu", (unsigned long)s_status_request_id);
+    helmet_cloud_close_status_stream();
+    s_status_request_pending = false;
+    s_status_request_tick = 0;
+    s_status_pcm_last_tick = 0;
 }
 
 static void helmet_cloud_handle_status_pcm(esp_mqtt_event_handle_t event)
@@ -665,6 +961,7 @@ static void helmet_cloud_handle_status_pcm(esp_mqtt_event_handle_t event)
     uint32_t request_id = 0;
     uint32_t seq = 0;
     uint32_t flags = 0;
+    bool packet_adpcm = false;
 
     if (!helmet_cloud_topic_to_cstr(event, topic, sizeof(topic))) {
         return;
@@ -690,15 +987,37 @@ static void helmet_cloud_handle_status_pcm(esp_mqtt_event_handle_t event)
         return;
     }
 
+    packet_adpcm = (flags & HELMET_CLOUD_PCM_FLAG_ADPCM) != 0U;
+
     if (!s_status_pcm_stream_open) {
-        esp_err_t ret = helmet_voice_stream_pcm_begin();
+        esp_err_t ret = helmet_cloud_status_file_open(request_id);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "status pcm stream begin failed: %s", esp_err_to_name(ret));
+            ESP_LOGW(TAG, "status pcm file begin failed: %s", esp_err_to_name(ret));
+            s_status_request_pending = false;
+            s_status_request_tick = 0;
+            s_status_pcm_last_tick = 0;
             return;
         }
 
         s_status_pcm_stream_open = true;
+        s_status_pcm_stream_adpcm = packet_adpcm;
+        if (s_status_pcm_stream_adpcm) {
+            helmet_cloud_adpcm_reset();
+        }
         s_status_pcm_expected_seq = seq;
+    } else if (packet_adpcm != s_status_pcm_stream_adpcm) {
+        ESP_LOGW(TAG, "status pcm codec flag changed, closing stream");
+        helmet_cloud_close_status_stream();
+        s_status_request_pending = false;
+        s_status_request_tick = 0;
+        s_status_pcm_last_tick = 0;
+        return;
+    }
+
+    s_status_pcm_last_tick = xTaskGetTickCount();
+
+    if (seq < s_status_pcm_expected_seq) {
+        return;
     }
 
     if (seq != s_status_pcm_expected_seq) {
@@ -712,11 +1031,15 @@ static void helmet_cloud_handle_status_pcm(esp_mqtt_event_handle_t event)
     }
 
     if (event->data_len > 0) {
-        esp_err_t ret = helmet_voice_stream_pcm_write(event->data, (size_t)event->data_len);
+        esp_err_t ret = s_status_pcm_stream_adpcm ?
+                        helmet_cloud_write_status_adpcm((const uint8_t *)event->data, (size_t)event->data_len) :
+                        helmet_cloud_status_file_write(event->data, (size_t)event->data_len);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "status pcm stream write failed: %s", esp_err_to_name(ret));
+            ESP_LOGW(TAG, "status pcm file write failed: %s", esp_err_to_name(ret));
             helmet_cloud_close_status_stream();
             s_status_request_pending = false;
+            s_status_request_tick = 0;
+            s_status_pcm_last_tick = 0;
             return;
         }
     }
@@ -724,9 +1047,22 @@ static void helmet_cloud_handle_status_pcm(esp_mqtt_event_handle_t event)
     s_status_pcm_expected_seq++;
 
     if ((flags & HELMET_CLOUD_PCM_FLAG_FINAL) != 0U) {
+        size_t file_bytes = s_status_pcm_file_bytes;
         helmet_cloud_close_status_stream();
         s_status_request_pending = false;
-        ESP_LOGI(TAG, "status pcm stream done request=%lu", (unsigned long)request_id);
+        s_status_request_tick = 0;
+        s_status_pcm_last_tick = 0;
+        if (file_bytes > 0) {
+            s_status_pcm_play_request_id = request_id;
+            s_status_pcm_play_queued = true;
+            if (s_cloud_task_handle != NULL) {
+                xTaskNotifyGive(s_cloud_task_handle);
+            }
+        } else {
+            remove(HELMET_CLOUD_STATUS_PCM_FILE_PATH);
+        }
+        ESP_LOGI(TAG, "status pcm file complete request=%lu bytes=%u",
+                 (unsigned long)request_id, (unsigned)file_bytes);
     }
 }
 
@@ -750,7 +1086,7 @@ static void helmet_mqtt_event_handler(
         esp_mqtt_client_subscribe(
             s_mqtt_client,
             HELMET_MQTT_TOPIC_STATUS_PCM "/#",
-            0
+            HELMET_CLOUD_STATUS_PCM_QOS
         );
         break;
 
@@ -871,6 +1207,9 @@ static void helmet_cloud_task(void *arg)
     ESP_LOGI(TAG, "cloud task started");
 
     while (1) {
+        helmet_cloud_service_status_pcm_playback();
+        helmet_cloud_service_status_pcm_timeout();
+
         if (!helmet_cloud_mqtt_is_configured()) {
             helmet_cloud_log_unconfigured_once();
             helmet_state_set_cloud(HELMET_CLOUD_OFFLINE);
@@ -897,11 +1236,16 @@ static void helmet_cloud_task(void *arg)
             if (request_ret != ESP_OK) {
                 ESP_LOGW(TAG, "status pcm request failed: %s", esp_err_to_name(request_ret));
             }
+        } else if (s_status_request_pending || s_status_pcm_stream_open || s_status_pcm_play_queued) {
+            /* Status downlink shares ESP-Hosted with telemetry; keep the link quiet while audio is arriving. */
         } else {
             helmet_cloud_publish_state_once();
         }
 
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(HELMET_CLOUD_REPORT_INTERVAL_MS));
+        uint32_t wait_ms = s_status_request_pending ?
+                           250U :
+                           (uint32_t)HELMET_CLOUD_REPORT_INTERVAL_MS;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
     }
 }
 
@@ -987,6 +1331,8 @@ static esp_err_t helmet_cloud_publish_status_pcm_request(void)
 
     s_status_request_pending = true;
     s_status_pcm_expected_seq = 0;
+    s_status_request_tick = xTaskGetTickCount();
+    s_status_pcm_last_tick = 0;
 
     int prefix_len = snprintf(
         s_cloud_status_payload,

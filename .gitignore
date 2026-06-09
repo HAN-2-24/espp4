@@ -26,6 +26,9 @@ __pycache__/
 # Logs
 *.log
 
+# Local secrets
+cloud/bridge_secrets.json
+
 # Local archives / backups
 *.rar
 *.zip

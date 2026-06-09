@@ -566,12 +566,36 @@ int hosted_sdio_read_block(void *ctx, uint32_t reg, uint8_t *data, uint16_t size
 		uint16_t padded = H_SDIO_RX_LEN_TO_TRANSFER(size);
 		if (padded < ESP_BLOCK_SIZE || padded != size || !sdio_dma_buffer_is_safe(data, size)) {
 			if (padded > SDIO_DMA_BOUNCE_BUFFER_SIZE) {
-				res = ESP_ERR_NO_MEM;
+				uint16_t remaining = padded;
+				uint16_t copied = 0;
+				uint32_t addr = reg;
+
+				while (remaining) {
+					uint16_t chunk = (remaining > SDIO_DMA_BOUNCE_BUFFER_SIZE) ?
+						SDIO_DMA_BOUNCE_BUFFER_SIZE : remaining;
+
+					res = sdio_read_fromio(card, SDIO_FUNC_1, addr, sdio_read_bounce_buf, chunk);
+					if (res != ESP_OK) {
+						break;
+					}
+
+					if (copied < size) {
+						uint16_t copy_len = size - copied;
+						if (copy_len > chunk) {
+							copy_len = chunk;
+						}
+						memcpy(data + copied, sdio_read_bounce_buf, copy_len);
+						copied += copy_len;
+					}
+
+					remaining -= chunk;
+					addr += chunk;
+				}
 			} else {
 				res = sdio_read_fromio(card, SDIO_FUNC_1, reg, sdio_read_bounce_buf, padded);
-			}
-			if (res == ESP_OK) {
-				memcpy(data, sdio_read_bounce_buf, size);
+				if (res == ESP_OK) {
+					memcpy(data, sdio_read_bounce_buf, size);
+				}
 			}
 		} else {
 			res = sdio_read_fromio(card, SDIO_FUNC_1, reg, data, padded);
