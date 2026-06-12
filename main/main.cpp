@@ -27,6 +27,25 @@ static const char *TAG = "main";
 
 static esp_ldo_channel_handle_t sd_ldo_handle = NULL;
 
+extern "C" void p4_tcm_heap_reserve_linker_hook(void);
+
+static void heap_alloc_failed_hook(size_t size, uint32_t caps, const char *function_name)
+{
+    ESP_EARLY_LOGE(
+        "heap_fail",
+        "size=%u caps=0x%lx func=%s int_free=%u int_largest=%u dma_free=%u dma_largest=%u psram_free=%u psram_largest=%u",
+        (unsigned)size,
+        (unsigned long)caps,
+        function_name ? function_name : "?",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)
+    );
+}
+
 static esp_err_t init_sd_ldo_only(void)
 {
     esp_ldo_channel_config_t ldo_cfg = {
@@ -38,6 +57,9 @@ static esp_err_t init_sd_ldo_only(void)
 
 extern "C" void app_main(void)
 {
+    p4_tcm_heap_reserve_linker_hook();
+    ESP_ERROR_CHECK(heap_caps_register_failed_alloc_callback(heap_alloc_failed_hook));
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());

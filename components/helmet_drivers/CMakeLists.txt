@@ -11,6 +11,8 @@ idf_component_register(
     REQUIRES
         driver
         esp_timer
+        esp_video
+        nvs_flash
         helmet_board
         helmet_core
         mqtt

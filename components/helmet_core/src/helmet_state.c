@@ -101,6 +101,15 @@ void helmet_state_set_eye(float eye_open_ratio, float perclos, uint32_t blink_co
     unlock_state();
 }
 
+void helmet_state_clear_eye(void)
+{
+    lock_state();
+
+    memset(&s_state.eye, 0, sizeof(s_state.eye));
+
+    unlock_state();
+}
+
 void helmet_state_set_pose(float roll, float pitch, float acc_total, bool fall_detected, bool impact_detected)
 {
     lock_state();

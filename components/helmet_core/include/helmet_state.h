@@ -74,6 +74,7 @@ typedef struct {
 void helmet_state_init(void);
 
 void helmet_state_set_eye(float eye_open_ratio, float perclos, uint32_t blink_count, bool yawn_detected);
+void helmet_state_clear_eye(void);
 void helmet_state_set_pose(float roll, float pitch, float acc_total, bool fall_detected, bool impact_detected);
 void helmet_state_set_location(bool valid, double latitude, double longitude, float speed, float course);
 void helmet_state_set_voice(helmet_voice_state_t voice);

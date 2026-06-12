@@ -5,12 +5,9 @@
  */
 #pragma once
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "lvgl.h"
 #include "esp_brookesia.hpp"
-#include "app_video.h"
-#include "esp_video_init.h"
+#include "helmet_vision.h"
 
 class Camera: public ESP_Brookesia_PhoneApp {
 public:
@@ -26,29 +23,45 @@ public:
     bool init(void) override;
 
 private:
-    static void taskCameraInit(Camera *app);
-    static void onScreenCameraShotBtnClick(lv_event_t *e);
-    static void onScreenCameraShotAlbumClick(lv_event_t *e);
-    static void camera_dectect_task(Camera *app);
+    enum RoiAction {
+        ROI_X_DEC,
+        ROI_X_INC,
+        ROI_Y_DEC,
+        ROI_Y_INC,
+        ROI_W_DEC,
+        ROI_W_INC,
+        ROI_H_DEC,
+        ROI_H_INC,
+        ROI_SAVE,
+        ROI_RESET,
+        ROI_ACTION_MAX,
+    };
 
-    enum {
-        SCREEN_CAMERA_SHOT,
-        SCREEN_CAMERA_PHOTO,
-        SCREEN_CAMERA_AI,
-    } _screen_index;
+    struct RoiButtonContext {
+        Camera *camera;
+        RoiAction action;
+    };
+
+    static void onTimer(lv_timer_t *timer);
+    static void onRoiButtonClick(lv_event_t *e);
+
+    void extraUiInit(void);
+    void updateFrame(void);
+    void updateStatusLabel(const helmet_vision_status_t &status, esp_err_t frame_ret);
+    bool ensureFrameBuffer(uint16_t width, uint16_t height);
+    void drawRoi(const helmet_vision_status_t &status);
+    void adjustRoi(RoiAction action);
+    lv_obj_t *createRoiButton(lv_obj_t *parent, const char *text, RoiAction action);
+
     uint16_t _hor_res;
     uint16_t _ver_res;
-    uint16_t _img_album_dsc_size;
-    uint32_t _img_album_buf_bytes;
-    uint8_t *_img_album_buffer;
-    SemaphoreHandle_t _camera_init_sem;
-    int _camera_ctlr_handle;
-    lv_img_dsc_t _img_refresh_dsc;
-    lv_img_dsc_t _img_album_dsc;
-    lv_img_dsc_t _img_photo_dsc;
-    lv_obj_t *_img_album;
-    TaskHandle_t _detect_task_handle;
-    uint8_t *_cam_buffer[EXAMPLE_CAM_BUF_NUM];
-    size_t _cam_buffer_size[EXAMPLE_CAM_BUF_NUM];
+    uint8_t *_frame_buffer;
+    size_t _frame_buffer_size;
+    lv_img_dsc_t _frame_dsc;
+    lv_timer_t *_timer;
+    lv_obj_t *_status_label;
+    lv_obj_t *_control_panel;
+    RoiButtonContext _button_ctx[ROI_ACTION_MAX];
+    int _button_ctx_count;
 };
 

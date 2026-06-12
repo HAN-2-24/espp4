@@ -55,7 +55,6 @@ bool HelmetDashboard::run(void)
     ui_helmet_init();
     extraUiInit();
 
-    feedBootDemoState();
     helmet_state_update_fusion();
     updateUi();
 
