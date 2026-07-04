@@ -584,7 +584,7 @@ def handle_status_query(
     state = as_dict(message.get("state"))
     print(f"[bridge] request={request_id} received state_keys={','.join(sorted(state.keys()))}")
 
-    try:
+    try: 
         target_rate = int(audio.get("sample_rate") or 16000)
         channels = int(audio.get("channels") or 1)
     except (TypeError, ValueError):

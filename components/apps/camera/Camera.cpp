@@ -24,16 +24,219 @@ static uint16_t rgb565_color(uint8_t r, uint8_t g, uint8_t b)
     return (uint16_t)(((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3));
 }
 
-static void draw_rect_rgb565(uint16_t *buffer, int width, int height, helmet_vision_roi_t roi, uint16_t color, int thickness)
+static const uint8_t *glyph3x5(char ch)
 {
-    if (!buffer || width <= 0 || height <= 0 || roi.w == 0 || roi.h == 0) {
+    static const uint8_t blank[5] = {0, 0, 0, 0, 0};
+    static const uint8_t underscore[5] = {0, 0, 0, 0, 7};
+    static const uint8_t dot[5] = {0, 0, 0, 0, 2};
+    static const uint8_t equal[5] = {0, 7, 0, 7, 0};
+    static const uint8_t dash[5] = {0, 0, 7, 0, 0};
+    static const uint8_t colon[5] = {0, 2, 0, 2, 0};
+    static const uint8_t digits[10][5] = {
+        {7, 5, 5, 5, 7},
+        {2, 6, 2, 2, 7},
+        {7, 1, 7, 4, 7},
+        {7, 1, 7, 1, 7},
+        {5, 5, 7, 1, 1},
+        {7, 4, 7, 1, 7},
+        {7, 4, 7, 5, 7},
+        {7, 1, 1, 1, 1},
+        {7, 5, 7, 5, 7},
+        {7, 5, 7, 1, 7},
+    };
+    static const uint8_t letters[26][5] = {
+        {7, 5, 7, 5, 5}, // A
+        {6, 5, 6, 5, 6}, // B
+        {7, 4, 4, 4, 7}, // C
+        {6, 5, 5, 5, 6}, // D
+        {7, 4, 6, 4, 7}, // E
+        {7, 4, 6, 4, 4}, // F
+        {7, 4, 5, 5, 7}, // G
+        {5, 5, 7, 5, 5}, // H
+        {7, 2, 2, 2, 7}, // I
+        {1, 1, 1, 5, 7}, // J
+        {5, 5, 6, 5, 5}, // K
+        {4, 4, 4, 4, 7}, // L
+        {5, 7, 7, 5, 5}, // M
+        {5, 7, 7, 7, 5}, // N
+        {7, 5, 5, 5, 7}, // O
+        {7, 5, 7, 4, 4}, // P
+        {7, 5, 5, 7, 1}, // Q
+        {7, 5, 7, 6, 5}, // R
+        {7, 4, 7, 1, 7}, // S
+        {7, 2, 2, 2, 2}, // T
+        {5, 5, 5, 5, 7}, // U
+        {5, 5, 5, 5, 2}, // V
+        {5, 5, 7, 7, 5}, // W
+        {5, 5, 2, 5, 5}, // X
+        {5, 5, 2, 2, 2}, // Y
+        {7, 1, 2, 4, 7}, // Z
+    };
+
+    if (ch >= '0' && ch <= '9') {
+        return digits[ch - '0'];
+    }
+    if (ch >= 'a' && ch <= 'z') {
+        ch = (char)(ch - 'a' + 'A');
+    }
+    if (ch >= 'A' && ch <= 'Z') {
+        return letters[ch - 'A'];
+    }
+    switch (ch) {
+    case '_':
+        return underscore;
+    case '.':
+        return dot;
+    case '=':
+        return equal;
+    case '-':
+        return dash;
+    case ':':
+        return colon;
+    default:
+        return blank;
+    }
+}
+
+static void fill_rect_rgb565(uint16_t *buffer, int width, int height, int x, int y, int w, int h, uint16_t color)
+{
+    if (!buffer || width <= 0 || height <= 0 || w <= 0 || h <= 0) {
+        return;
+    }
+    int x1 = x < 0 ? 0 : x;
+    int y1 = y < 0 ? 0 : y;
+    int x2 = x + w;
+    int y2 = y + h;
+    if (x2 > width) {
+        x2 = width;
+    }
+    if (y2 > height) {
+        y2 = height;
+    }
+    for (int py = y1; py < y2; ++py) {
+        uint16_t *row = buffer + py * width;
+        for (int px = x1; px < x2; ++px) {
+            row[px] = color;
+        }
+    }
+}
+
+static void draw_char3x5_rgb565(uint16_t *buffer, int width, int height, int x, int y, char ch, int scale, uint16_t color)
+{
+    const uint8_t *glyph = glyph3x5(ch);
+    for (int row = 0; row < 5; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            if ((glyph[row] & (1U << (2 - col))) == 0) {
+                continue;
+            }
+            fill_rect_rgb565(buffer, width, height, x + col * scale, y + row * scale, scale, scale, color);
+        }
+    }
+}
+
+static void draw_text3x5_rgb565(uint16_t *buffer, int width, int height, int x, int y, const char *text, int scale, uint16_t color)
+{
+    if (!text) {
+        return;
+    }
+    int cursor_x = x;
+    int advance = 4 * scale;
+    while (*text != '\0') {
+        draw_char3x5_rgb565(buffer, width, height, cursor_x, y, *text, scale, color);
+        cursor_x += advance;
+        text++;
+    }
+}
+
+static size_t text_len(const char *text)
+{
+    return text ? strlen(text) : 0;
+}
+
+static const char *eye_state_name(helmet_vision_eye_state_t state)
+{
+    switch (state) {
+    case HELMET_VISION_EYE_STATE_OPEN:
+        return "OPEN";
+    case HELMET_VISION_EYE_STATE_CLOSED:
+        return "CLOSED";
+    case HELMET_VISION_EYE_STATE_INVALID:
+        return "INVALID";
+    case HELMET_VISION_EYE_STATE_NO_MODEL:
+        return "NO_MODEL";
+    case HELMET_VISION_EYE_STATE_UNKNOWN:
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *reason_name(helmet_vision_reason_t reason)
+{
+    switch (reason) {
+    case HELMET_VISION_REASON_NONE:
+        return "OK";
+    case HELMET_VISION_REASON_NO_MODEL:
+        return "NO_MODEL";
+    case HELMET_VISION_REASON_NO_DETECTION:
+        return "NO_DETECTION";
+    case HELMET_VISION_REASON_RUNTIME_BUSY:
+        return "BUSY";
+    case HELMET_VISION_REASON_LOW_CONFIDENCE:
+        return "LOW_CONF";
+    case HELMET_VISION_REASON_CAMERA_ERROR:
+        return "CAMERA_ERROR";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *overlay_pred_name(const helmet_vision_status_t &status)
+{
+    if (!status.model_ready || status.eye_state == HELMET_VISION_EYE_STATE_NO_MODEL) {
+        return "NO_MODEL";
+    }
+    if (status.eye_valid && status.eye_state == HELMET_VISION_EYE_STATE_CLOSED) {
+        return "CLOSED";
+    }
+    if (status.eye_valid && status.eye_state == HELMET_VISION_EYE_STATE_OPEN) {
+        return "OPEN";
+    }
+    if (status.last_reason == HELMET_VISION_REASON_NO_DETECTION) {
+        return "BACKGROUND";
+    }
+    if (status.last_reason == HELMET_VISION_REASON_LOW_CONFIDENCE) {
+        return "LOW_CONF";
+    }
+    return reason_name(status.last_reason);
+}
+
+static uint16_t overlay_pred_color(const helmet_vision_status_t &status)
+{
+    if (!status.model_ready || status.eye_state == HELMET_VISION_EYE_STATE_NO_MODEL) {
+        return rgb565_color(255, 208, 64);
+    }
+    if (status.eye_valid && status.eye_state == HELMET_VISION_EYE_STATE_CLOSED) {
+        return rgb565_color(255, 64, 64);
+    }
+    if (status.eye_valid && status.eye_state == HELMET_VISION_EYE_STATE_OPEN) {
+        return rgb565_color(64, 255, 128);
+    }
+    if (status.last_reason == HELMET_VISION_REASON_NO_DETECTION) {
+        return rgb565_color(255, 208, 64);
+    }
+    return rgb565_color(255, 160, 64);
+}
+
+static void draw_rect_rgb565(uint16_t *buffer, int width, int height, helmet_vision_bbox_t bbox, uint16_t color, int thickness)
+{
+    if (!buffer || width <= 0 || height <= 0 || bbox.w == 0 || bbox.h == 0) {
         return;
     }
 
-    int x1 = roi.x;
-    int y1 = roi.y;
-    int x2 = roi.x + roi.w - 1;
-    int y2 = roi.y + roi.h - 1;
+    int x1 = bbox.x;
+    int y1 = bbox.y;
+    int x2 = bbox.x + bbox.w - 1;
+    int y2 = bbox.y + bbox.h - 1;
 
     if (x1 < 0) {
         x1 = 0;
@@ -80,9 +283,7 @@ Camera::Camera(uint16_t hor_res, uint16_t ver_res):
     _frame_dsc({}),
     _timer(NULL),
     _status_label(NULL),
-    _control_panel(NULL),
-    _button_ctx({}),
-    _button_ctx_count(0)
+    _canvas_ready(false)
 {
 }
 
@@ -104,7 +305,7 @@ bool Camera::run(void)
     updateFrame();
 
     if (_timer == NULL) {
-        _timer = lv_timer_create(onTimer, 120, this);
+        _timer = lv_timer_create(onTimer, 250, this);
     }
 
     return true;
@@ -146,8 +347,7 @@ bool Camera::close(void)
     }
     _frame_buffer_size = 0;
     _status_label = NULL;
-    _control_panel = NULL;
-    _button_ctx_count = 0;
+    _canvas_ready = false;
 
     return true;
 }
@@ -160,61 +360,7 @@ void Camera::extraUiInit(void)
     lv_obj_add_flag(ui_PanelCameraShotAlbum, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(ui_ImageCameraShotImage, LV_OBJ_FLAG_SCROLLABLE);
 
-    _status_label = lv_label_create(ui_ImageCameraShotImage);
-    lv_obj_set_width(_status_label, 620);
-    lv_obj_set_style_text_font(_status_label, &lv_font_montserrat_16, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_color(_status_label, lv_color_hex(0xffffff), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(_status_label, lv_color_hex(0x101820), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(_status_label, LV_OPA_70, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_all(_status_label, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(_status_label, LV_ALIGN_TOP_LEFT, 16, 16);
-
-    _control_panel = lv_obj_create(ui_ImageCameraShotImage);
-    lv_obj_set_size(_control_panel, 560, 104);
-    lv_obj_set_style_radius(_control_panel, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(_control_panel, lv_color_hex(0x101820), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(_control_panel, LV_OPA_70, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(_control_panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_all(_control_panel, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_row(_control_panel, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_column(_control_panel, 8, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_flex_flow(_control_panel, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_align(_control_panel, LV_ALIGN_BOTTOM_LEFT, 16, -16);
-
-    createRoiButton(_control_panel, "X-", ROI_X_DEC);
-    createRoiButton(_control_panel, "X+", ROI_X_INC);
-    createRoiButton(_control_panel, "Y-", ROI_Y_DEC);
-    createRoiButton(_control_panel, "Y+", ROI_Y_INC);
-    createRoiButton(_control_panel, "W-", ROI_W_DEC);
-    createRoiButton(_control_panel, "W+", ROI_W_INC);
-    createRoiButton(_control_panel, "H-", ROI_H_DEC);
-    createRoiButton(_control_panel, "H+", ROI_H_INC);
-    createRoiButton(_control_panel, "Save", ROI_SAVE);
-    createRoiButton(_control_panel, "Reset", ROI_RESET);
-}
-
-lv_obj_t *Camera::createRoiButton(lv_obj_t *parent, const char *text, RoiAction action)
-{
-    if (_button_ctx_count >= ROI_ACTION_MAX) {
-        return NULL;
-    }
-
-    RoiButtonContext *ctx = &_button_ctx[_button_ctx_count++];
-    ctx->camera = this;
-    ctx->action = action;
-
-    lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_size(btn, 92, 38);
-    lv_obj_set_style_radius(btn, 5, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x2d6cdf), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_add_event_cb(btn, onRoiButtonClick, LV_EVENT_CLICKED, ctx);
-
-    lv_obj_t *label = lv_label_create(btn);
-    lv_label_set_text(label, text);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_center(label);
-
-    return btn;
+    _status_label = NULL;
 }
 
 bool Camera::ensureFrameBuffer(uint16_t width, uint16_t height)
@@ -241,6 +387,7 @@ bool Camera::ensureFrameBuffer(uint16_t width, uint16_t height)
     }
 
     _frame_buffer_size = needed;
+    _canvas_ready = false;
     _frame_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
     _frame_dsc.header.always_zero = 0;
     _frame_dsc.header.reserved = 0;
@@ -252,16 +399,61 @@ bool Camera::ensureFrameBuffer(uint16_t width, uint16_t height)
     return true;
 }
 
-void Camera::drawRoi(const helmet_vision_status_t &status)
+void Camera::drawEyeBox(const helmet_vision_status_t &status)
 {
-    if (!_frame_buffer || !status.frame_valid) {
+    if (!_frame_buffer || !status.frame_valid || status.eye_bbox.w == 0 || status.eye_bbox.h == 0) {
         return;
     }
 
     uint16_t color = status.eye_valid
                          ? (status.eye_closed ? rgb565_color(255, 64, 64) : rgb565_color(64, 255, 128))
                          : rgb565_color(255, 208, 64);
-    draw_rect_rgb565((uint16_t *)_frame_buffer, status.frame_width, status.frame_height, status.roi, color, 4);
+    draw_rect_rgb565((uint16_t *)_frame_buffer, status.frame_width, status.frame_height, status.eye_bbox, color, 4);
+}
+
+void Camera::drawInferenceOverlay(const helmet_vision_status_t &status)
+{
+    if (!_frame_buffer || !status.frame_valid || status.frame_width == 0 || status.frame_height == 0) {
+        return;
+    }
+
+    uint16_t *buffer = (uint16_t *)_frame_buffer;
+    int width = status.frame_width;
+    int height = status.frame_height;
+    int scale = width >= 480 ? 3 : (width >= 240 ? 2 : 1);
+    int x = 8;
+    int y = 8;
+    int line_h = 6 * scale;
+    int char_w = 4 * scale;
+    uint16_t bg = rgb565_color(0, 0, 0);
+    uint16_t fg = overlay_pred_color(status);
+    uint16_t white = rgb565_color(245, 245, 245);
+
+    char line1[40];
+    char line2[72];
+    char line3[48];
+    snprintf(line1, sizeof(line1), "PRED %s", overlay_pred_name(status));
+    snprintf(line2,
+             sizeof(line2),
+             "CONF=%.3f O=%.3f C=%.3f BG=%.3f",
+             status.eye_confidence,
+             status.open_score,
+             status.closed_score,
+             status.background_score);
+    snprintf(line3, sizeof(line3), "INFER=%luMS FRAME=%lu", (unsigned long)status.last_infer_ms, (unsigned long)status.frame_seq);
+
+    size_t max_chars = text_len(line1);
+    if (text_len(line2) > max_chars) {
+        max_chars = text_len(line2);
+    }
+    if (text_len(line3) > max_chars) {
+        max_chars = text_len(line3);
+    }
+
+    fill_rect_rgb565(buffer, width, height, x - 4, y - 4, (int)max_chars * char_w + 8, line_h * 3 + 8, bg);
+    draw_text3x5_rgb565(buffer, width, height, x, y, line1, scale, fg);
+    draw_text3x5_rgb565(buffer, width, height, x, y + line_h, line2, scale, white);
+    draw_text3x5_rgb565(buffer, width, height, x, y + line_h * 2, line3, scale, white);
 }
 
 void Camera::updateStatusLabel(const helmet_vision_status_t &status, esp_err_t frame_ret)
@@ -275,40 +467,38 @@ void Camera::updateStatusLabel(const helmet_vision_status_t &status, esp_err_t f
         if (status.eye_valid) {
             snprintf(text,
                      sizeof(text),
-                     "Vision %s | Eye %s | Open %.2f | PERCLOS %.2f | Blink %lu\nROI x%u y%u w%u h%u | Frame %lu",
+                     "Vision %s | Model READY | Eye %s | Conf %.2f\nOpen %.2f | PERCLOS %.2f | Blink %lu | Box x%u y%u w%u h%u | Frame %lu",
                      status.running ? "RUN" : "STOP",
-                     status.eye_closed ? "CLOSED" : "OPEN",
+                     eye_state_name(status.eye_state),
+                     status.eye_confidence,
                      status.eye_open_ratio,
                      status.perclos,
                      (unsigned long)status.blink_count,
-                     status.roi.x,
-                     status.roi.y,
-                     status.roi.w,
-                     status.roi.h,
+                     status.eye_bbox.x,
+                     status.eye_bbox.y,
+                     status.eye_bbox.w,
+                     status.eye_bbox.h,
                      (unsigned long)status.frame_seq);
         } else {
             snprintf(text,
                      sizeof(text),
-                     "Vision %s | Eye INVALID | NoEye %lums\nROI x%u y%u w%u h%u | Frame %lu",
+                     "Vision %s | Model %s | Eye %s | Reason %s\nNoEye %lums | Frame %lu",
                      status.running ? "RUN" : "STOP",
+                     status.model_ready ? "READY" : "NO_MODEL",
+                     eye_state_name(status.eye_state),
+                     reason_name(status.last_reason),
                      (unsigned long)status.no_eye_ms,
-                     status.roi.x,
-                     status.roi.y,
-                     status.roi.w,
-                     status.roi.h,
                      (unsigned long)status.frame_seq);
         }
     } else {
         snprintf(text,
                  sizeof(text),
-                 "Vision %s | Frame unavailable: %s\nLast error: %s | ROI x%u y%u w%u h%u",
+                 "Vision %s | Frame unavailable: %s\nLast error: %s | Eye %s | Reason %s",
                  status.running ? "RUN" : "STOP",
                  esp_err_to_name(frame_ret),
                  esp_err_to_name(status.last_error),
-                 status.roi.x,
-                 status.roi.y,
-                 status.roi.w,
-                 status.roi.h);
+                 eye_state_name(status.eye_state),
+                 reason_name(status.last_reason));
     }
     lv_label_set_text(_status_label, text);
 }
@@ -322,76 +512,24 @@ void Camera::updateFrame(void)
     if (status.frame_width > 0 && status.frame_height > 0 && ensureFrameBuffer(status.frame_width, status.frame_height)) {
         frame_ret = helmet_vision_copy_frame(_frame_buffer, _frame_buffer_size, &status);
         if (frame_ret == ESP_OK) {
-            drawRoi(status);
-            lv_canvas_set_buffer(ui_ImageCameraShotImage,
-                                 _frame_buffer,
-                                 status.frame_width,
-                                 status.frame_height,
-                                 LV_IMG_CF_TRUE_COLOR);
-            lv_obj_set_size(ui_ImageCameraShotImage, status.frame_width, status.frame_height);
-            lv_obj_center(ui_ImageCameraShotImage);
+            drawEyeBox(status);
+            drawInferenceOverlay(status);
+            if (!_canvas_ready) {
+                lv_canvas_set_buffer(ui_ImageCameraShotImage,
+                                     _frame_buffer,
+                                     status.frame_width,
+                                     status.frame_height,
+                                     LV_IMG_CF_TRUE_COLOR);
+                lv_obj_set_size(ui_ImageCameraShotImage, status.frame_width, status.frame_height);
+                lv_obj_center(ui_ImageCameraShotImage);
+                _canvas_ready = true;
+            } else {
+                lv_obj_invalidate(ui_ImageCameraShotImage);
+            }
         }
     }
 
     updateStatusLabel(status, frame_ret);
-}
-
-void Camera::adjustRoi(RoiAction action)
-{
-    helmet_vision_status_t status = {};
-    if (helmet_vision_get_status(&status) != ESP_OK || status.frame_width == 0 || status.frame_height == 0) {
-        return;
-    }
-
-    helmet_vision_roi_t roi = status.roi;
-    int step_x = status.frame_width / 80;
-    int step_y = status.frame_height / 80;
-    if (step_x < 4) {
-        step_x = 4;
-    }
-    if (step_y < 4) {
-        step_y = 4;
-    }
-
-    switch (action) {
-    case ROI_X_DEC:
-        roi.x = (uint16_t)((roi.x > step_x) ? roi.x - step_x : 0);
-        break;
-    case ROI_X_INC:
-        roi.x = (uint16_t)(roi.x + step_x);
-        break;
-    case ROI_Y_DEC:
-        roi.y = (uint16_t)((roi.y > step_y) ? roi.y - step_y : 0);
-        break;
-    case ROI_Y_INC:
-        roi.y = (uint16_t)(roi.y + step_y);
-        break;
-    case ROI_W_DEC:
-        roi.w = (uint16_t)((roi.w > step_x * 2) ? roi.w - step_x : roi.w);
-        break;
-    case ROI_W_INC:
-        roi.w = (uint16_t)(roi.w + step_x);
-        break;
-    case ROI_H_DEC:
-        roi.h = (uint16_t)((roi.h > step_y * 2) ? roi.h - step_y : roi.h);
-        break;
-    case ROI_H_INC:
-        roi.h = (uint16_t)(roi.h + step_y);
-        break;
-    case ROI_SAVE:
-        helmet_vision_set_roi(&roi, true);
-        updateFrame();
-        return;
-    case ROI_RESET:
-        helmet_vision_reset_roi();
-        updateFrame();
-        return;
-    default:
-        return;
-    }
-
-    helmet_vision_set_roi(&roi, false);
-    updateFrame();
 }
 
 void Camera::onTimer(lv_timer_t *timer)
@@ -399,13 +537,5 @@ void Camera::onTimer(lv_timer_t *timer)
     Camera *camera = static_cast<Camera *>(timer->user_data);
     if (camera) {
         camera->updateFrame();
-    }
-}
-
-void Camera::onRoiButtonClick(lv_event_t *e)
-{
-    RoiButtonContext *ctx = static_cast<RoiButtonContext *>(lv_event_get_user_data(e));
-    if (ctx && ctx->camera) {
-        ctx->camera->adjustRoi(ctx->action);
     }
 }

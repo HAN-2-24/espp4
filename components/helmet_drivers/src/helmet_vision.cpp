@@ -19,47 +19,51 @@
 #include "esp_timer.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
+#include "eye_state_detector.hpp"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "helmet_state.h"
+#include "helmet_voice.h"
 #include "linux/videodev2.h"
-#include "nvs.h"
 
 static const char *TAG = "helmet_vision";
 
-static constexpr const char *kNvsNamespace = "helmet_vision";
-static constexpr const char *kNvsRoiKey = "eye_roi";
-static constexpr uint32_t kRoiMagic = 0x45594531; /* EYE1 */
 static constexpr int kFrameBufferCount = 2;
 static constexpr uint16_t kTargetFrameWidth = 640;
 static constexpr uint16_t kTargetFrameHeight = 480;
 static constexpr int kVisionTaskStack = 8192;
 static constexpr int kVisionTaskPriority = 4;
-static constexpr int kSampleIntervalMs = 100;
+static constexpr int kDetectorTaskStack = 8192;
+static constexpr int kDetectorTaskPriority = 2;
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+static constexpr BaseType_t kVisionTaskCore = 0;
+static constexpr BaseType_t kDetectorTaskCore = 1;
+#else
+static constexpr BaseType_t kVisionTaskCore = 0;
+static constexpr BaseType_t kDetectorTaskCore = 0;
+#endif
+static constexpr int kInferIntervalMs = 100;
+static constexpr int kEyeStateIntervalMs = 100;
 static constexpr int kPerclosWindowSamples = 300;
 static constexpr int64_t kNoEyeTimeoutUs = 3000000;
-static constexpr float kClosedThreshold = 0.35f;
-
-typedef struct {
-    uint32_t magic;
-    uint16_t x;
-    uint16_t y;
-    uint16_t w;
-    uint16_t h;
-} vision_roi_nvs_t;
+static constexpr float kFatiguePerclosThreshold = 0.45f;
+static constexpr int64_t kFatigueAlarmRetryUs = 5000000;
+static constexpr int64_t kFatigueAlarmRepeatUs = 30000000;
 
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_task;
+static TaskHandle_t s_detector_task;
+static SemaphoreHandle_t s_infer_signal;
 static bool s_video_inited;
 static int s_video_fd = -1;
 static uint8_t *s_frame_buffers[kFrameBufferCount];
 static uint8_t *s_latest_frame;
+static uint8_t *s_infer_frame;
 static size_t s_frame_size;
+static size_t s_infer_frame_size;
 static size_t s_cache_line_size = 64;
 static helmet_vision_status_t s_status;
-static vision_roi_nvs_t s_saved_roi;
-static bool s_saved_roi_valid;
 
 static bool s_tracker_ready;
 static uint8_t s_closed_history[kPerclosWindowSamples];
@@ -71,19 +75,22 @@ static bool s_prev_closed;
 static uint32_t s_blink_count;
 static float s_smoothed_open;
 static int64_t s_last_sample_us;
+static int64_t s_last_infer_submit_us;
 static int64_t s_last_valid_eye_us;
+static int64_t s_eye_invalid_since_us;
 static int64_t s_last_diag_us;
-
-static int clamp_int(int value, int low, int high)
-{
-    if (value < low) {
-        return low;
-    }
-    if (value > high) {
-        return high;
-    }
-    return value;
-}
+static int64_t s_last_infer_diag_us;
+static int64_t s_last_fatigue_alarm_attempt_us;
+static int64_t s_last_fatigue_alarm_ok_us;
+static int64_t s_last_fatigue_alarm_block_us;
+static bool s_fatigue_alarm_latched;
+static bool s_eye_state_published;
+static bool s_infer_pending;
+static bool s_infer_running;
+static uint16_t s_infer_width;
+static uint16_t s_infer_height;
+static uint32_t s_infer_frame_seq;
+static uint32_t s_infer_skip_count;
 
 static float clamp_float(float value, float low, float high)
 {
@@ -110,14 +117,6 @@ static void unlock_state(void)
     }
 }
 
-static uint8_t rgb565_luma(uint16_t pixel)
-{
-    uint8_t r = (uint8_t)(((pixel >> 11) & 0x1f) * 255 / 31);
-    uint8_t g = (uint8_t)(((pixel >> 5) & 0x3f) * 255 / 63);
-    uint8_t b = (uint8_t)((pixel & 0x1f) * 255 / 31);
-    return (uint8_t)((77 * r + 150 * g + 29 * b) >> 8);
-}
-
 static void log_heap_snapshot(const char *stage)
 {
     ESP_LOGI(
@@ -133,198 +132,6 @@ static void log_heap_snapshot(const char *stage)
     );
 }
 
-static helmet_vision_roi_t default_roi(uint16_t width, uint16_t height)
-{
-    helmet_vision_roi_t roi = {};
-    roi.x = width / 4;
-    roi.y = (uint16_t)((height * 32) / 100);
-    roi.w = width / 2;
-    roi.h = (uint16_t)((height * 28) / 100);
-    return roi;
-}
-
-static helmet_vision_roi_t clamp_roi(helmet_vision_roi_t roi, uint16_t width, uint16_t height)
-{
-    if (width == 0 || height == 0) {
-        return {};
-    }
-
-    int min_w = width / 32;
-    int min_h = height / 32;
-    if (min_w < 16) {
-        min_w = 16;
-    }
-    if (min_h < 12) {
-        min_h = 12;
-    }
-
-    roi.w = (uint16_t)clamp_int(roi.w, min_w, width);
-    roi.h = (uint16_t)clamp_int(roi.h, min_h, height);
-    roi.x = (uint16_t)clamp_int(roi.x, 0, width - roi.w);
-    roi.y = (uint16_t)clamp_int(roi.y, 0, height - roi.h);
-    return roi;
-}
-
-static helmet_vision_roi_t roi_from_nvs(const vision_roi_nvs_t &saved, uint16_t width, uint16_t height)
-{
-    helmet_vision_roi_t roi = {};
-    roi.x = (uint16_t)((uint32_t)saved.x * width / 10000);
-    roi.y = (uint16_t)((uint32_t)saved.y * height / 10000);
-    roi.w = (uint16_t)((uint32_t)saved.w * width / 10000);
-    roi.h = (uint16_t)((uint32_t)saved.h * height / 10000);
-    return clamp_roi(roi, width, height);
-}
-
-static vision_roi_nvs_t roi_to_nvs(helmet_vision_roi_t roi, uint16_t width, uint16_t height)
-{
-    vision_roi_nvs_t saved = {};
-    saved.magic = kRoiMagic;
-    if (width > 0 && height > 0) {
-        saved.x = (uint16_t)((uint32_t)roi.x * 10000 / width);
-        saved.y = (uint16_t)((uint32_t)roi.y * 10000 / height);
-        saved.w = (uint16_t)((uint32_t)roi.w * 10000 / width);
-        saved.h = (uint16_t)((uint32_t)roi.h * 10000 / height);
-    }
-    return saved;
-}
-
-static void load_roi_from_nvs(void)
-{
-    nvs_handle_t nvs = 0;
-    esp_err_t ret = nvs_open(kNvsNamespace, NVS_READONLY, &nvs);
-    if (ret != ESP_OK) {
-        return;
-    }
-
-    vision_roi_nvs_t saved = {};
-    size_t len = sizeof(saved);
-    ret = nvs_get_blob(nvs, kNvsRoiKey, &saved, &len);
-    nvs_close(nvs);
-
-    if (ret == ESP_OK && len == sizeof(saved) && saved.magic == kRoiMagic && saved.w > 0 && saved.h > 0) {
-        s_saved_roi = saved;
-        s_saved_roi_valid = true;
-        ESP_LOGI(TAG, "loaded ROI from NVS x=%u y=%u w=%u h=%u", saved.x, saved.y, saved.w, saved.h);
-    }
-}
-
-static esp_err_t save_roi_to_nvs(helmet_vision_roi_t roi, uint16_t width, uint16_t height)
-{
-    nvs_handle_t nvs = 0;
-    ESP_RETURN_ON_ERROR(nvs_open(kNvsNamespace, NVS_READWRITE, &nvs), TAG, "open NVS failed");
-
-    vision_roi_nvs_t saved = roi_to_nvs(roi, width, height);
-    esp_err_t ret = nvs_set_blob(nvs, kNvsRoiKey, &saved, sizeof(saved));
-    if (ret == ESP_OK) {
-        ret = nvs_commit(nvs);
-    }
-    nvs_close(nvs);
-
-    if (ret == ESP_OK) {
-        s_saved_roi = saved;
-        s_saved_roi_valid = true;
-        ESP_LOGI(TAG, "saved ROI x=%u y=%u w=%u h=%u", saved.x, saved.y, saved.w, saved.h);
-    }
-    return ret;
-}
-
-static void apply_initial_roi_locked(uint16_t width, uint16_t height)
-{
-    if (s_saved_roi_valid) {
-        s_status.roi = roi_from_nvs(s_saved_roi, width, height);
-    } else {
-        s_status.roi = default_roi(width, height);
-    }
-}
-
-static float estimate_eye_open_ratio(const uint8_t *frame, uint16_t width, uint16_t height, helmet_vision_roi_t roi)
-{
-    if (!frame || width == 0 || height == 0 || roi.w < 16 || roi.h < 12) {
-        return -1.0f;
-    }
-
-    roi = clamp_roi(roi, width, height);
-    const uint16_t *pixels = reinterpret_cast<const uint16_t *>(frame);
-    int step_x = (roi.w > 360) ? 3 : ((roi.w > 180) ? 2 : 1);
-    int step_y = (roi.h > 240) ? 3 : ((roi.h > 120) ? 2 : 1);
-
-    uint32_t sum = 0;
-    int samples = 0;
-    uint8_t min_luma = 255;
-    uint8_t max_luma = 0;
-
-    for (int y = roi.y; y < roi.y + roi.h; y += step_y) {
-        const uint16_t *row = pixels + y * width;
-        for (int x = roi.x; x < roi.x + roi.w; x += step_x) {
-            uint8_t y8 = rgb565_luma(row[x]);
-            sum += y8;
-            samples++;
-            if (y8 < min_luma) {
-                min_luma = y8;
-            }
-            if (y8 > max_luma) {
-                max_luma = y8;
-            }
-        }
-    }
-
-    if (samples < 64 || max_luma <= min_luma + 10) {
-        return -1.0f;
-    }
-
-    int mean = (int)(sum / samples);
-    int contrast = max_luma - min_luma;
-    int dark_threshold = mean - clamp_int(contrast / 5, 8, 28);
-    dark_threshold = clamp_int(dark_threshold, 0, 255);
-
-    int active_first = -1;
-    int active_last = -1;
-    int row_index = 0;
-    int row_count = 0;
-    int dark_count = 0;
-
-    for (int y = roi.y; y < roi.y + roi.h; y += step_y, row_index++) {
-        const uint16_t *row = pixels + y * width;
-        int row_dark = 0;
-        int row_samples = 0;
-
-        for (int x = roi.x; x < roi.x + roi.w; x += step_x) {
-            if (rgb565_luma(row[x]) < dark_threshold) {
-                row_dark++;
-            }
-            row_samples++;
-        }
-
-        if (row_samples > 0) {
-            int active_threshold = row_samples / 12;
-            if (active_threshold < 2) {
-                active_threshold = 2;
-            }
-            if (row_dark >= active_threshold) {
-                if (active_first < 0) {
-                    active_first = row_index;
-                }
-                active_last = row_index;
-            }
-        }
-        dark_count += row_dark;
-        row_count++;
-    }
-
-    if (row_count == 0 || active_first < 0) {
-        return -1.0f;
-    }
-
-    float span_ratio = (float)(active_last - active_first + 1) / (float)row_count;
-    float dark_ratio = (float)dark_count / (float)samples;
-    float span_score = (span_ratio - 0.12f) / 0.36f;
-    float density_score = (dark_ratio - 0.05f) / 0.20f;
-    float contrast_score = (contrast - 10.0f) / 70.0f;
-    float open = span_score * 0.65f + density_score * 0.25f + contrast_score * 0.10f;
-
-    return clamp_float(open, 0.0f, 1.0f);
-}
-
 static void reset_eye_tracker_locked(void)
 {
     memset(s_closed_history, 0, sizeof(s_closed_history));
@@ -338,50 +145,155 @@ static void reset_eye_tracker_locked(void)
     s_tracker_ready = false;
 }
 
-static void update_eye_state(float raw_open)
+static void clear_eye_business_state(void)
 {
+    if (s_eye_state_published) {
+        s_eye_state_published = false;
+        helmet_state_clear_eye();
+        helmet_state_update_fusion();
+    }
+}
+
+static void update_fatigue_alarm_from_state(void)
+{
+    helmet_state_t state = helmet_state_get_copy();
+    bool fatigue_source = state.eye.valid &&
+                          (state.eye.perclos >= kFatiguePerclosThreshold || state.eye.yawn_detected);
+
+    if (!fatigue_source) {
+        s_fatigue_alarm_latched = false;
+        return;
+    }
+
     int64_t now = esp_timer_get_time();
-    if (raw_open < 0.0f) {
-        uint32_t no_eye_ms = 0;
-        bool should_clear = false;
 
-        lock_state();
-        if (s_last_valid_eye_us > 0) {
-            no_eye_ms = (uint32_t)((now - s_last_valid_eye_us) / 1000);
-            should_clear = (now - s_last_valid_eye_us) >= kNoEyeTimeoutUs;
-        }
-        s_status.eye_valid = false;
-        s_status.no_eye_ms = no_eye_ms;
-        if (should_clear) {
-            reset_eye_tracker_locked();
-            s_status.eye_closed = false;
-            s_status.eye_open_ratio = 0.0f;
-            s_status.perclos = 0.0f;
-        }
-        unlock_state();
-
-        if (should_clear) {
-            helmet_state_clear_eye();
-            helmet_state_update_fusion();
+    if (state.alarm_suppressed || state.risk != HELMET_RISK_FATIGUE || !state.alarm_active) {
+        if (s_last_fatigue_alarm_block_us == 0 ||
+            (now - s_last_fatigue_alarm_block_us) >= 3000000) {
+            s_last_fatigue_alarm_block_us = now;
+            ESP_LOGW(TAG,
+                     "fatigue alarm blocked: risk=%s active=%d suppressed=%d perclos=%.2f",
+                     helmet_risk_to_string(state.risk),
+                     state.alarm_active ? 1 : 0,
+                     state.alarm_suppressed ? 1 : 0,
+                     state.eye.perclos);
         }
         return;
     }
 
-    if (s_last_sample_us > 0 && (now - s_last_sample_us) < (int64_t)kSampleIntervalMs * 1000) {
+    bool repeat_due = s_last_fatigue_alarm_ok_us == 0 ||
+                      (now - s_last_fatigue_alarm_ok_us) >= kFatigueAlarmRepeatUs;
+    bool retry_due = s_last_fatigue_alarm_attempt_us == 0 ||
+                     (now - s_last_fatigue_alarm_attempt_us) >= kFatigueAlarmRetryUs;
+
+    if (s_fatigue_alarm_latched && !repeat_due) {
+        return;
+    }
+    if (!retry_due) {
+        return;
+    }
+
+    s_last_fatigue_alarm_attempt_us = now;
+    esp_err_t voice_ret = helmet_voice_play_alert(HELMET_VOICE_ALERT_FATIGUE);
+    if (voice_ret == ESP_OK) {
+        s_last_fatigue_alarm_ok_us = now;
+        s_fatigue_alarm_latched = true;
+    }
+
+    ESP_LOGW(TAG,
+             "fatigue alarm trigger: perclos=%.2f blink=%" PRIu32 " voice=%s",
+             state.eye.perclos,
+             state.eye.blink_count,
+             esp_err_to_name(voice_ret));
+}
+
+static void mark_eye_invalid(helmet_vision_reason_t reason,
+                             helmet_vision_eye_state_t eye_state,
+                             float confidence,
+                             float open_score,
+                             float closed_score,
+                             float background_score)
+{
+    if (reason == HELMET_VISION_REASON_RUNTIME_BUSY) {
+        return;
+    }
+
+    int64_t now = esp_timer_get_time();
+    bool should_clear_business = false;
+
+    lock_state();
+    if (s_eye_invalid_since_us == 0) {
+        s_eye_invalid_since_us = now;
+    }
+
+    uint32_t no_eye_ms = (uint32_t)((now - s_eye_invalid_since_us) / 1000);
+    bool immediate_clear = (reason == HELMET_VISION_REASON_NO_MODEL || reason == HELMET_VISION_REASON_CAMERA_ERROR);
+    bool timed_out = no_eye_ms >= (uint32_t)(kNoEyeTimeoutUs / 1000);
+
+    s_status.model_ready = eye_state_detector_model_ready();
+    s_status.eye_valid = false;
+    s_status.eye_closed = false;
+    s_status.eye_state = eye_state;
+    s_status.last_reason = reason;
+    s_status.eye_confidence = clamp_float(confidence, 0.0f, 1.0f);
+    s_status.open_score = clamp_float(open_score, 0.0f, 1.0f);
+    s_status.closed_score = clamp_float(closed_score, 0.0f, 1.0f);
+    s_status.background_score = clamp_float(background_score, 0.0f, 1.0f);
+    s_status.no_eye_ms = no_eye_ms;
+
+    if (immediate_clear || timed_out) {
+        reset_eye_tracker_locked();
+        s_status.eye_open_ratio = 0.0f;
+        s_status.perclos = 0.0f;
+        s_status.blink_count = 0;
+        s_status.eye_bbox = {};
+        should_clear_business = s_eye_state_published;
+    }
+    unlock_state();
+
+    if (immediate_clear || timed_out || should_clear_business) {
+        clear_eye_business_state();
+    }
+}
+
+static void update_eye_state_from_detector(const eye_state_detector_result_t &result)
+{
+    if (result.reason == HELMET_VISION_REASON_RUNTIME_BUSY) {
+        return;
+    }
+
+    if (!result.valid) {
+        helmet_vision_eye_state_t eye_state = result.eye_state == HELMET_VISION_EYE_STATE_UNKNOWN
+                                                  ? HELMET_VISION_EYE_STATE_INVALID
+                                                  : result.eye_state;
+        mark_eye_invalid(result.reason,
+                         eye_state,
+                         result.confidence,
+                         result.open_score,
+                         result.closed_score,
+                         result.background_score);
+        return;
+    }
+
+    int64_t now = esp_timer_get_time();
+
+    if (s_last_sample_us > 0 && (now - s_last_sample_us) < (int64_t)kEyeStateIntervalMs * 1000) {
         return;
     }
     s_last_sample_us = now;
     s_last_valid_eye_us = now;
 
-    bool closed = false;
+    bool closed = result.closed || result.eye_state == HELMET_VISION_EYE_STATE_CLOSED;
     float perclos = 0.0f;
     uint32_t blink_count = 0;
+    float raw_open = clamp_float(result.open_ratio, 0.0f, 1.0f);
     float smoothed = raw_open;
-    helmet_vision_roi_t roi = {};
+    helmet_vision_bbox_t bbox = result.bbox;
     uint16_t frame_width = 0;
     uint16_t frame_height = 0;
 
     lock_state();
+    s_eye_invalid_since_us = 0;
 
     if (!s_tracker_ready) {
         memset(s_closed_history, 0, sizeof(s_closed_history));
@@ -398,7 +310,6 @@ static void update_eye_state(float raw_open)
     }
 
     smoothed = s_smoothed_open;
-    closed = smoothed < kClosedThreshold;
 
     if (s_history_count == kPerclosWindowSamples) {
         s_closed_count -= s_closed_history[s_history_index] ? 1 : 0;
@@ -424,11 +335,18 @@ static void update_eye_state(float raw_open)
 
     s_status.eye_valid = true;
     s_status.eye_closed = closed;
+    s_status.model_ready = true;
+    s_status.eye_state = closed ? HELMET_VISION_EYE_STATE_CLOSED : HELMET_VISION_EYE_STATE_OPEN;
+    s_status.last_reason = HELMET_VISION_REASON_NONE;
     s_status.eye_open_ratio = smoothed;
+    s_status.eye_confidence = clamp_float(result.confidence, 0.0f, 1.0f);
+    s_status.open_score = clamp_float(result.open_score, 0.0f, 1.0f);
+    s_status.closed_score = clamp_float(result.closed_score, 0.0f, 1.0f);
+    s_status.background_score = clamp_float(result.background_score, 0.0f, 1.0f);
     s_status.perclos = perclos;
     s_status.blink_count = blink_count;
     s_status.no_eye_ms = 0;
-    roi = s_status.roi;
+    s_status.eye_bbox = bbox;
     frame_width = s_status.frame_width;
     frame_height = s_status.frame_height;
 
@@ -437,13 +355,14 @@ static void update_eye_state(float raw_open)
     if ((now - s_last_diag_us) >= 5000000) {
         s_last_diag_us = now;
         ESP_LOGI(TAG,
-                 "eye diag frame=%ux%u roi=%u,%u,%u,%u open=%.2f perclos=%.2f closed=%d blink=%" PRIu32,
+                 "eye model frame=%ux%u bbox=%u,%u,%u,%u conf=%.2f open=%.2f perclos=%.2f closed=%d blink=%" PRIu32,
                  frame_width,
                  frame_height,
-                 roi.x,
-                 roi.y,
-                 roi.w,
-                 roi.h,
+                 bbox.x,
+                 bbox.y,
+                 bbox.w,
+                 bbox.h,
+                 result.confidence,
                  smoothed,
                  perclos,
                  closed ? 1 : 0,
@@ -451,7 +370,9 @@ static void update_eye_state(float raw_open)
     }
 
     helmet_state_set_eye(smoothed, perclos, blink_count, false);
+    s_eye_state_published = true;
     helmet_state_update_fusion();
+    update_fatigue_alarm_from_state();
 }
 
 static void update_latest_frame(const uint8_t *frame)
@@ -465,6 +386,99 @@ static void update_latest_frame(const uint8_t *frame)
     s_status.frame_valid = true;
     s_status.frame_seq++;
     unlock_state();
+}
+
+static bool submit_inference_frame(const uint8_t *frame, uint16_t width, uint16_t height, int64_t now)
+{
+    if (!frame || !s_infer_signal || width == 0 || height == 0) {
+        return false;
+    }
+
+    size_t frame_size = (size_t)width * height * sizeof(uint16_t);
+    if (frame_size == 0) {
+        return false;
+    }
+
+    lock_state();
+    bool ready = s_infer_frame != NULL && s_infer_frame_size >= frame_size && !s_infer_pending && !s_infer_running &&
+                 (s_last_infer_submit_us == 0 ||
+                  (now - s_last_infer_submit_us) >= (int64_t)kInferIntervalMs * 1000);
+    if (ready) {
+        s_infer_pending = true;
+        s_infer_width = width;
+        s_infer_height = height;
+        s_infer_frame_seq = s_status.frame_seq;
+        s_last_infer_submit_us = now;
+    } else if (s_infer_pending || s_infer_running) {
+        s_infer_skip_count++;
+    }
+    unlock_state();
+
+    if (!ready) {
+        return false;
+    }
+
+    memcpy(s_infer_frame, frame, frame_size);
+    xSemaphoreGive(s_infer_signal);
+    return true;
+}
+
+static void detector_task(void *arg)
+{
+    (void)arg;
+
+    while (true) {
+        if (xSemaphoreTake(s_infer_signal, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        uint8_t *frame = NULL;
+        uint16_t width = 0;
+        uint16_t height = 0;
+        uint32_t frame_seq = 0;
+
+        lock_state();
+        if (s_infer_pending && s_infer_frame != NULL && s_infer_width > 0 && s_infer_height > 0) {
+            s_infer_pending = false;
+            s_infer_running = true;
+            frame = s_infer_frame;
+            width = s_infer_width;
+            height = s_infer_height;
+            frame_seq = s_infer_frame_seq;
+        }
+        unlock_state();
+
+        if (!frame) {
+            continue;
+        }
+
+        int64_t start = esp_timer_get_time();
+        eye_state_detector_result_t result =
+            eye_state_detector_detect(frame, width, height, (size_t)width * sizeof(uint16_t));
+        int64_t elapsed_us = esp_timer_get_time() - start;
+
+        update_eye_state_from_detector(result);
+
+        uint32_t skip_count = 0;
+        lock_state();
+        s_infer_running = false;
+        s_status.last_infer_ms = (uint32_t)(elapsed_us / 1000);
+        skip_count = s_infer_skip_count;
+        s_infer_skip_count = 0;
+        unlock_state();
+
+        int64_t now = esp_timer_get_time();
+        if (elapsed_us >= 150000 || (now - s_last_infer_diag_us) >= 5000000) {
+            s_last_infer_diag_us = now;
+            ESP_LOGI(TAG,
+                     "eye infer frame=%" PRIu32 " time=%" PRIi64 "ms skipped=%" PRIu32,
+                     frame_seq,
+                     elapsed_us / 1000,
+                     skip_count);
+        }
+
+        vTaskDelay(1);
+    }
 }
 
 static esp_err_t init_video_once(void)
@@ -547,6 +561,17 @@ static esp_err_t allocate_camera_buffers(uint16_t width, uint16_t height)
 
     s_latest_frame = (uint8_t *)heap_caps_aligned_alloc(s_cache_line_size, frame_size, MALLOC_CAP_SPIRAM);
     ESP_RETURN_ON_FALSE(s_latest_frame, ESP_ERR_NO_MEM, TAG, "alloc latest frame failed");
+
+    if (s_infer_frame_size < frame_size) {
+        if (s_infer_frame) {
+            heap_caps_free(s_infer_frame);
+            s_infer_frame = NULL;
+            s_infer_frame_size = 0;
+        }
+        s_infer_frame = (uint8_t *)heap_caps_aligned_alloc(s_cache_line_size, frame_size, MALLOC_CAP_SPIRAM);
+        ESP_RETURN_ON_FALSE(s_infer_frame, ESP_ERR_NO_MEM, TAG, "alloc inference frame failed");
+        s_infer_frame_size = frame_size;
+    }
 
     s_frame_size = frame_size;
     ESP_LOGI(TAG, "allocated vision buffers count=%d frame=%u", kFrameBufferCount, (unsigned)frame_size);
@@ -676,9 +701,11 @@ static esp_err_t open_camera(void)
     s_video_fd = fd;
     s_status.running = true;
     s_status.last_error = ESP_OK;
+    s_status.model_ready = eye_state_detector_model_ready();
+    s_status.eye_state = s_status.model_ready ? HELMET_VISION_EYE_STATE_UNKNOWN : HELMET_VISION_EYE_STATE_NO_MODEL;
+    s_status.last_reason = s_status.model_ready ? HELMET_VISION_REASON_NONE : HELMET_VISION_REASON_NO_MODEL;
     s_status.frame_width = width;
     s_status.frame_height = height;
-    apply_initial_roi_locked(width, height);
     unlock_state();
 
     ESP_LOGI(TAG, "vision stream started");
@@ -698,6 +725,8 @@ static void close_camera(void)
     s_status.running = false;
     s_status.frame_valid = false;
     s_status.eye_valid = false;
+    s_status.eye_state = HELMET_VISION_EYE_STATE_INVALID;
+    s_status.last_reason = HELMET_VISION_REASON_CAMERA_ERROR;
     unlock_state();
 
     free_camera_buffers();
@@ -717,19 +746,17 @@ static esp_err_t receive_frame_and_process(void)
     }
 
     if (frame) {
-        helmet_vision_roi_t roi = {};
         uint16_t width = 0;
         uint16_t height = 0;
+        int64_t now = esp_timer_get_time();
 
         lock_state();
-        roi = s_status.roi;
         width = s_status.frame_width;
         height = s_status.frame_height;
         unlock_state();
 
-        float open_ratio = estimate_eye_open_ratio(frame, width, height, roi);
-        update_eye_state(open_ratio);
         update_latest_frame(frame);
+        submit_inference_frame(frame, width, height, now);
     }
 
     buf.m.userptr = (unsigned long)frame;
@@ -751,6 +778,8 @@ static void vision_task(void *arg)
             s_status.running = false;
             s_status.frame_valid = false;
             s_status.eye_valid = false;
+            s_status.eye_state = HELMET_VISION_EYE_STATE_INVALID;
+            s_status.last_reason = HELMET_VISION_REASON_CAMERA_ERROR;
             unlock_state();
 
             helmet_state_clear_eye();
@@ -764,10 +793,15 @@ static void vision_task(void *arg)
             if (ret != ESP_OK) {
                 lock_state();
                 s_status.last_error = ret;
+                s_status.eye_valid = false;
+                s_status.eye_state = HELMET_VISION_EYE_STATE_INVALID;
+                s_status.last_reason = HELMET_VISION_REASON_CAMERA_ERROR;
                 unlock_state();
                 ESP_LOGE(TAG, "vision stream error: %s", esp_err_to_name(ret));
                 break;
             }
+
+            vTaskDelay(1);
         }
 
         close_camera();
@@ -783,15 +817,46 @@ extern "C" esp_err_t helmet_vision_init(void)
         s_lock = xSemaphoreCreateMutex();
         ESP_RETURN_ON_FALSE(s_lock, ESP_ERR_NO_MEM, TAG, "create vision mutex failed");
     }
+    if (s_infer_signal == NULL) {
+        s_infer_signal = xSemaphoreCreateBinary();
+        ESP_RETURN_ON_FALSE(s_infer_signal, ESP_ERR_NO_MEM, TAG, "create inference signal failed");
+    }
 
-    load_roi_from_nvs();
+    log_heap_snapshot("before eye detector init");
+    ESP_RETURN_ON_ERROR(eye_state_detector_init(), TAG, "init eye detector failed");
+    log_heap_snapshot("after eye detector init");
+
+    lock_state();
+    s_status.model_ready = eye_state_detector_model_ready();
+    s_status.eye_state = s_status.model_ready ? HELMET_VISION_EYE_STATE_UNKNOWN : HELMET_VISION_EYE_STATE_NO_MODEL;
+    s_status.last_reason = s_status.model_ready ? HELMET_VISION_REASON_NONE : HELMET_VISION_REASON_NO_MODEL;
+    unlock_state();
+
+    ESP_LOGI(TAG, "vision service initialized");
+    return ESP_OK;
+}
+
+extern "C" esp_err_t helmet_vision_start(void)
+{
+    if (s_detector_task == NULL) {
+        BaseType_t ok =
+            xTaskCreatePinnedToCore(detector_task,
+                                    "eye detector",
+                                    kDetectorTaskStack,
+                                    NULL,
+                                    kDetectorTaskPriority,
+                                    &s_detector_task,
+                                    kDetectorTaskCore);
+        ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "create eye detector task failed");
+    }
 
     if (s_task == NULL) {
-        BaseType_t ok = xTaskCreatePinnedToCore(vision_task, "helmet vision", kVisionTaskStack, NULL, kVisionTaskPriority, &s_task, 1);
+        BaseType_t ok =
+            xTaskCreatePinnedToCore(vision_task, "helmet vision", kVisionTaskStack, NULL, kVisionTaskPriority, &s_task, kVisionTaskCore);
         ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "create vision task failed");
     }
 
-    ESP_LOGI(TAG, "vision service initialized");
+    ESP_LOGI(TAG, "vision capture started");
     return ESP_OK;
 }
 
@@ -830,56 +895,46 @@ extern "C" esp_err_t helmet_vision_copy_frame(void *dst, size_t dst_size, helmet
     return ESP_OK;
 }
 
-extern "C" esp_err_t helmet_vision_get_roi(helmet_vision_roi_t *out_roi)
+extern "C" esp_err_t helmet_vision_copy_scaled_frame(void *dst,
+                                                      size_t dst_size,
+                                                      uint8_t scale,
+                                                      helmet_vision_status_t *out_status)
 {
-    ESP_RETURN_ON_FALSE(out_roi, ESP_ERR_INVALID_ARG, TAG, "ROI output is NULL");
-    lock_state();
-    *out_roi = s_status.roi;
-    unlock_state();
-    return ESP_OK;
-}
-
-extern "C" esp_err_t helmet_vision_set_roi(const helmet_vision_roi_t *roi, bool save_to_nvs)
-{
-    ESP_RETURN_ON_FALSE(roi, ESP_ERR_INVALID_ARG, TAG, "ROI input is NULL");
-
-    helmet_vision_roi_t clamped = {};
-    uint16_t width = 0;
-    uint16_t height = 0;
+    ESP_RETURN_ON_FALSE(dst, ESP_ERR_INVALID_ARG, TAG, "scaled frame dst is NULL");
+    ESP_RETURN_ON_FALSE(scale > 0, ESP_ERR_INVALID_ARG, TAG, "scaled frame scale is zero");
 
     lock_state();
-    width = s_status.frame_width;
-    height = s_status.frame_height;
-    if (width == 0 || height == 0) {
+    if (out_status) {
+        *out_status = s_status;
+    }
+    if (!s_status.frame_valid || !s_latest_frame || s_frame_size == 0 || s_status.frame_width == 0 || s_status.frame_height == 0) {
         unlock_state();
         return ESP_ERR_INVALID_STATE;
     }
-    clamped = clamp_roi(*roi, width, height);
-    s_status.roi = clamped;
-    unlock_state();
 
-    if (save_to_nvs) {
-        return save_roi_to_nvs(clamped, width, height);
-    }
-    return ESP_OK;
-}
-
-extern "C" esp_err_t helmet_vision_reset_roi(void)
-{
-    helmet_vision_roi_t roi = {};
-    uint16_t width = 0;
-    uint16_t height = 0;
-
-    lock_state();
-    width = s_status.frame_width;
-    height = s_status.frame_height;
-    if (width == 0 || height == 0) {
+    uint16_t out_w = s_status.frame_width / scale;
+    uint16_t out_h = s_status.frame_height / scale;
+    if (out_w == 0 || out_h == 0) {
         unlock_state();
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_SIZE;
     }
-    roi = default_roi(width, height);
-    s_status.roi = roi;
-    unlock_state();
 
-    return save_roi_to_nvs(roi, width, height);
+    size_t payload_size = (size_t)out_w * out_h * sizeof(uint16_t);
+    if (dst_size < payload_size) {
+        unlock_state();
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const uint16_t *src = reinterpret_cast<const uint16_t *>(s_latest_frame);
+    uint16_t *out = reinterpret_cast<uint16_t *>(dst);
+    for (uint16_t y = 0; y < out_h; ++y) {
+        const uint16_t *src_row = src + (uint32_t)y * scale * s_status.frame_width;
+        uint16_t *out_row = out + (uint32_t)y * out_w;
+        for (uint16_t x = 0; x < out_w; ++x) {
+            out_row[x] = src_row[(uint32_t)x * scale];
+        }
+    }
+
+    unlock_state();
+    return ESP_OK;
 }

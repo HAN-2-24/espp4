@@ -34,7 +34,7 @@ dependencies:
       type: service
     version: 1.0.3
   espressif/button:
-    component_hash: d0afa32f0e50d60bc0c6fc23f7eea98adc6b02cfe70b590bc52c23c506745287
+    component_hash: 95babe831403e301511a22a4dfcd599abcf32cf72c7f8ac5352a61662363c9ea
     dependencies:
     - name: espressif/cmake_utilities
       registry_url: https://components.espressif.com
@@ -46,7 +46,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 4.1.6
+    version: 4.1.7
   espressif/cjson:
     component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
     dependencies:
@@ -109,6 +109,23 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.4.2
+  espressif/esp-dl:
+    component_hash: 8077cda03ac2d892733611ece7c6c1cbac8bcc99eb4f4cf9d46c957afd02e6fb
+    dependencies:
+    - name: espressif/esp_jpeg
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.0.5~3
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s3
+    - esp32p4
+    version: 3.1.0
   espressif/esp-dsp:
     component_hash: 12e44db246517a627bc0fe2b255b8335410c0215c98bfba2df5a8e3edea839ef
     dependencies:
@@ -249,6 +266,16 @@ dependencies:
       type: service
     targets:
     - esp32p4
+    version: 1.3.1
+  espressif/esp_jpeg:
+    component_hash: defb83669293cbf86d0fa86b475ba5517aceed04ed70db435388c151ab37b5d7
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
     version: 1.3.1
   espressif/esp_lcd_ek79007:
     component_hash: c5a0501fbab972031026aa6144354b31ed6db899cf2ee5a22ca4ebaf3fea1657
@@ -419,7 +446,7 @@ dependencies:
       type: service
     version: 2.0.0
   espressif/esp_new_jpeg:
-    component_hash: 98823384f51ca298e2c9bebacd1c629148e528ed0902d18b16556df151519e68
+    component_hash: e1e7e6991193c41ed6c9fc386702aa7821433319e7aa9c3147cd3236310cd69c
     dependencies: []
     source:
       registry_url: https://components.espressif.com
@@ -436,7 +463,7 @@ dependencies:
     - esp32c6
     - esp32c61
     - esp32h4
-    version: 1.0.1
+    version: 1.0.2
   espressif/esp_sccb_intf:
     component_hash: c071b189e49f40940722aea01a5489f873385cc39cd5b14012341135b85d1a9d
     dependencies:
@@ -457,6 +484,26 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.1.2
+  espressif/esp_tinyusb:
+    component_hash: 8e57a14ac14d8e4d4588b5b9222977b96475323bcebae3c838919bb4e8587887
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    - name: espressif/tinyusb
+      registry_url: https://components.espressif.com
+      require: public
+      version: '>=0.17.0~2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    - esp32h4
+    - esp32s31
+    version: 2.2.0
   espressif/esp_video:
     component_hash: ba8f4aa63ad9bda3cc18a3afe1b9ba5b39c7359a6ad79392a94e42ba8cf9e5f8
     dependencies:
@@ -558,6 +605,22 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.6.58
+  espressif/tinyusb:
+    component_hash: a40b7f67df6ac254a4afd96c6401cc56f2059ae747d6d7e66b568bca53ad0edc
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    - esp32h4
+    - esp32s31
+    version: 0.19.0~3
   espressif/usb_host_uvc:
     component_hash: f20c4e4dea50536e2e29daaf589b5f5984402284c155867daef27d6b64869f78
     dependencies:
@@ -606,13 +669,15 @@ direct_dependencies:
 - chmorgan/esp-audio-player
 - chmorgan/esp-file-iterator
 - espressif/esp-brookesia
+- espressif/esp-dl
 - espressif/esp-sr
 - espressif/esp32_p4_function_ev_board_noglib
 - espressif/esp_hosted
 - espressif/esp_lvgl_adapter
+- espressif/esp_tinyusb
 - espressif/esp_video
 - espressif/esp_wifi_remote
 - idf
-manifest_hash: 6bfc995e75284e84d2e9702416d847850a438767a8e48343391f79ebcffaa02b
+manifest_hash: 1e0dfc9b8889bb1393bd00d8d3a77e0b4bb99f5939268cb10d6e84ddd71def86
 target: esp32p4
 version: 2.0.0

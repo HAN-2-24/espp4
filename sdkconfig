@@ -1606,10 +1606,12 @@ CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_PRE_CONFIGURE_MEMORY_PROTECTION=y
 # CONFIG_SPIRAM_IGNORE_NOTFOUND is not set
 # CONFIG_SPIRAM_USE_MEMMAP is not set
-CONFIG_SPIRAM_USE_CAPS_ALLOC=y
-# CONFIG_SPIRAM_USE_MALLOC is not set
+# CONFIG_SPIRAM_USE_CAPS_ALLOC is not set
+CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MEMTEST=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 # CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 # CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is not set
 # CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY is not set
 # end of PSRAM config
@@ -3062,6 +3064,22 @@ CONFIG_ESP_IPA_EXT_CONFIG=y
 # end of Espressif Image Process Algorithm Configuration
 
 #
+# JPEG Decoder
+#
+CONFIG_JD_SZBUF=512
+CONFIG_JD_FORMAT=0
+CONFIG_JD_FORMAT_RGB888=y
+# CONFIG_JD_FORMAT_RGB565 is not set
+CONFIG_JD_USE_SCALE=y
+CONFIG_JD_TBLCLIP=y
+CONFIG_JD_FASTDECODE=1
+# CONFIG_JD_FASTDECODE_BASIC is not set
+CONFIG_JD_FASTDECODE_32BIT=y
+# CONFIG_JD_FASTDECODE_TABLE is not set
+# CONFIG_JD_DEFAULT_HUFFMAN is not set
+# end of JPEG Decoder
+
+#
 # ESP LCD TOUCH
 #
 CONFIG_ESP_LCD_TOUCH_MAX_POINTS=5
@@ -3090,6 +3108,98 @@ CONFIG_MMAP_FILE_NAME_LENGTH=16
 #
 CONFIG_ESP_SCCB_TRANS_TIMEOUT_DEFAULT=500
 # end of Espressif SCCB Configurations
+
+#
+# TinyUSB Stack
+#
+CONFIG_TINYUSB_DEBUG_LEVEL=1
+
+#
+# TinyUSB DCD
+#
+# CONFIG_TINYUSB_MODE_SLAVE is not set
+CONFIG_TINYUSB_MODE_DMA=y
+# end of TinyUSB DCD
+
+#
+# TinyUSB callbacks
+#
+# CONFIG_TINYUSB_SUSPEND_CALLBACK is not set
+# CONFIG_TINYUSB_RESUME_CALLBACK is not set
+# end of TinyUSB callbacks
+
+#
+# Descriptor configuration
+#
+
+#
+# You can provide your custom descriptors via tinyusb_driver_install()
+#
+CONFIG_TINYUSB_DESC_USE_ESPRESSIF_VID=y
+CONFIG_TINYUSB_DESC_USE_DEFAULT_PID=y
+CONFIG_TINYUSB_DESC_BCD_DEVICE=0x0100
+CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="Espressif Systems"
+CONFIG_TINYUSB_DESC_PRODUCT_STRING="Helmet Camera Debug"
+CONFIG_TINYUSB_DESC_SERIAL_STRING="123456"
+CONFIG_TINYUSB_DESC_CDC_STRING="Espressif CDC Device"
+# end of Descriptor configuration
+
+#
+# Mass Storage Class (MSC)
+#
+# CONFIG_TINYUSB_MSC_ENABLED is not set
+# end of Mass Storage Class (MSC)
+
+#
+# Communication Device Class (CDC)
+#
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+CONFIG_TINYUSB_CDC_RX_BUFSIZE=512
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=1024
+CONFIG_TINYUSB_CDC_EP_BUFSIZE=512
+# end of Communication Device Class (CDC)
+
+#
+# Musical Instrument Digital Interface (MIDI)
+#
+CONFIG_TINYUSB_MIDI_COUNT=0
+# end of Musical Instrument Digital Interface (MIDI)
+
+#
+# Human Interface Device Class (HID)
+#
+CONFIG_TINYUSB_HID_COUNT=0
+# end of Human Interface Device Class (HID)
+
+#
+# Device Firmware Upgrade (DFU)
+#
+# CONFIG_TINYUSB_DFU_MODE_DFU is not set
+# CONFIG_TINYUSB_DFU_MODE_DFU_RUNTIME is not set
+CONFIG_TINYUSB_DFU_MODE_NONE=y
+# end of Device Firmware Upgrade (DFU)
+
+#
+# Bluetooth Host Class (BTH)
+#
+# CONFIG_TINYUSB_BTH_ENABLED is not set
+# end of Bluetooth Host Class (BTH)
+
+#
+# Network driver (ECM/NCM/RNDIS)
+#
+# CONFIG_TINYUSB_NET_MODE_ECM_RNDIS is not set
+# CONFIG_TINYUSB_NET_MODE_NCM is not set
+CONFIG_TINYUSB_NET_MODE_NONE=y
+# end of Network driver (ECM/NCM/RNDIS)
+
+#
+# Vendor Specific Interface
+#
+CONFIG_TINYUSB_VENDOR_COUNT=0
+# end of Vendor Specific Interface
+# end of TinyUSB Stack
 
 #
 # Espressif Video Configuration

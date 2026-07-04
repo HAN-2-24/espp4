@@ -3,10 +3,12 @@
 #include "helmet_state.h"
 #include "helmet_voice_cmd.h"
 
+#include "sdkconfig.h"
 #include "esp_err.h"
 #include "esp_log.h"
 
 #include "bsp/esp32_p4_function_ev_board.h"
+#include "driver/gpio.h"
 #include "esp_codec_dev.h"
 
 #include "freertos/FreeRTOS.h"
@@ -26,6 +28,7 @@
 extern const esp_afe_sr_iface_t *esp_afe_handle_from_config(afe_config_t *afe_config);
 
 #include <stdbool.h>
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,7 +38,10 @@ static const char *TAG = "helmet_voice";
 
 static bool s_voice_inited = false;
 static TaskHandle_t s_voice_capture_task_handle = NULL;
+static TaskHandle_t s_voice_sr_init_task_handle = NULL;
+static TaskHandle_t s_voice_alert_task_handle = NULL;
 static SemaphoreHandle_t s_voice_output_mutex = NULL;
+static SemaphoreHandle_t s_voice_alert_signal = NULL;
 
 static esp_codec_dev_handle_t s_spk_codec = NULL;
 static esp_codec_dev_handle_t s_mic_codec = NULL;
@@ -55,8 +61,24 @@ static esp_codec_dev_handle_t s_mic_codec = NULL;
 
 #define VOICE_LOG_EVERY_N_FRAMES          500
 #define VOICE_AFE_VAD_ENABLED             0
+#define VOICE_SR_INIT_TASK_STACK_SIZE      8192
+#define VOICE_SR_INIT_TASK_PRIORITY        3
+#define VOICE_ALERT_TASK_STACK_SIZE        3072
+#define VOICE_ALERT_TASK_PRIORITY          5
+#define VOICE_ALERT_COUNT                  3
+#define VOICE_FATIGUE_REPEAT_MS            30000
+#define VOICE_DANGER_REPEAT_MS             10000
+#define VOICE_DEFAULT_REPEAT_MS            30000
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+#define VOICE_SR_INIT_TASK_CORE            1
+#define VOICE_ALERT_TASK_CORE              1
+#else
+#define VOICE_SR_INIT_TASK_CORE            0
+#define VOICE_ALERT_TASK_CORE              0
+#endif
 
 #define VOICE_ACCIDENT_PCM_PATH           BSP_SPIFFS_MOUNT_POINT "/music/accident.pcm"
+#define VOICE_TIRED_PCM_PATH              BSP_SPIFFS_MOUNT_POINT "/music/tired.pcm"
 #define VOICE_ALERT_NONE                  (-1)
 #define VOICE_MN_CANCEL_ID                HELMET_VOICE_CMD_CANCEL_ALARM
 #define VOICE_MN_STATUS_ID                HELMET_VOICE_CMD_REPORT_STATUS
@@ -64,7 +86,7 @@ static esp_codec_dev_handle_t s_mic_codec = NULL;
 static int16_t s_capture_pcm[VOICE_CAPTURE_FRAMES];
 
 #define TEST_BEEP_FRAMES                  512
-#define TEST_BEEP_AMPLITUDE               6000
+#define TEST_BEEP_AMPLITUDE               16000
 static int16_t s_beep[TEST_BEEP_FRAMES];
 
 typedef enum {
@@ -78,6 +100,9 @@ static volatile voice_runtime_state_t s_voice_runtime = VOICE_RUNTIME_IDLE;
 static volatile bool s_voice_output_busy = false;
 static volatile bool s_voice_stop_requested = false;
 static volatile int s_pending_alert = VOICE_ALERT_NONE;
+static volatile int s_current_alert = VOICE_ALERT_NONE;
+static volatile bool s_output_prepared = false;
+static uint32_t s_last_alert_ms[VOICE_ALERT_COUNT];
 
 static const esp_afe_sr_iface_t *s_afe_handle = NULL;
 static esp_afe_sr_data_t *s_afe_data = NULL;
@@ -102,6 +127,74 @@ static void make_test_beep(void)
         int16_t v = ((i / 8) % 2 == 0) ? TEST_BEEP_AMPLITUDE : -TEST_BEEP_AMPLITUDE;
         s_beep[i] = v;
     }
+}
+
+static esp_err_t voice_prepare_output(void)
+{
+    if (s_spk_codec == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    gpio_set_direction(BSP_POWER_AMP_IO, GPIO_MODE_OUTPUT);
+    gpio_set_level(BSP_POWER_AMP_IO, 1);
+
+    int ret = esp_codec_dev_set_out_mute(s_spk_codec, false);
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "codec unmute failed: %s", esp_err_to_name(ret));
+    }
+
+    if (s_output_prepared) {
+        return ESP_OK;
+    }
+
+    ret = esp_codec_dev_set_out_vol(s_spk_codec, HELMET_AUDIO_VOLUME);
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "codec volume failed: %s", esp_err_to_name(ret));
+    }
+
+    s_output_prepared = true;
+
+    return ESP_OK;
+}
+
+static esp_err_t voice_write_pcm_bytes(const void *pcm, size_t bytes)
+{
+    if (s_spk_codec == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (pcm == NULL || bytes == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if ((bytes & 1U) != 0U) {
+        bytes--;
+    }
+
+    if (bytes == 0) {
+        return ESP_OK;
+    }
+
+    size_t done = 0;
+    while (done < bytes) {
+        size_t chunk = bytes - done;
+        if (chunk > sizeof(s_beep)) {
+            chunk = sizeof(s_beep);
+        }
+
+        if (pcm != (const void *)s_beep) {
+            memcpy(s_beep, (const uint8_t *)pcm + done, chunk);
+        }
+
+        int ret = esp_codec_dev_write(s_spk_codec, s_beep, (int)chunk);
+        if (ret != ESP_CODEC_DEV_OK) {
+            return (esp_err_t)ret;
+        }
+
+        done += chunk;
+    }
+
+    return ESP_OK;
 }
 
 static bool voice_output_lock(TickType_t ticks_to_wait)
@@ -434,21 +527,19 @@ static bool voice_try_cancel_from_mic(void)
 
 static esp_err_t test_speaker_once(void)
 {
-    if (s_spk_codec == NULL) {
-        ESP_LOGE(TAG, "speaker test failed: speaker codec is NULL");
-        return ESP_ERR_INVALID_STATE;
-    }
-
     make_test_beep();
 
     s_voice_output_busy = true;
     s_voice_runtime = VOICE_RUNTIME_PLAYING;
 
-    ESP_LOGI(TAG, "speaker test: write bytes=%u", (unsigned)sizeof(s_beep));
+    ESP_LOGI(TAG, "speaker test: mono_frames=%u bytes=%u",
+             (unsigned)TEST_BEEP_FRAMES,
+             (unsigned)sizeof(s_beep));
 
     esp_err_t ret = ESP_ERR_TIMEOUT;
     if (voice_output_lock(pdMS_TO_TICKS(200))) {
-        ret = esp_codec_dev_write(s_spk_codec, s_beep, sizeof(s_beep));
+        esp_err_t prep_ret = voice_prepare_output();
+        ret = (prep_ret == ESP_OK) ? voice_write_pcm_bytes(s_beep, sizeof(s_beep)) : prep_ret;
         voice_output_unlock();
     }
 
@@ -457,7 +548,7 @@ static esp_err_t test_speaker_once(void)
     s_voice_output_busy = false;
     s_voice_runtime = VOICE_RUNTIME_IDLE;
 
-    ESP_LOGI(TAG, "speaker test: ret=%s", esp_err_to_name(ret));
+    ESP_LOGI(TAG, "speaker test ret=%s", esp_err_to_name(ret));
 
     return ret;
 }
@@ -477,6 +568,22 @@ static esp_err_t voice_play_pcm_file(const char *path)
     ESP_LOGI(TAG, "play pcm file: %s", path);
 
     esp_err_t ret = ESP_OK;
+    size_t total_bytes = 0;
+
+    if (!voice_output_lock(pdMS_TO_TICKS(200))) {
+        ESP_LOGW(TAG, "speaker output lock timeout");
+        fclose(file);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    ret = voice_prepare_output();
+    voice_output_unlock();
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "prepare speaker failed: %s", esp_err_to_name(ret));
+        fclose(file);
+        return ret;
+    }
 
     while (!s_voice_stop_requested) {
         size_t bytes_read = fread(
@@ -511,13 +618,15 @@ static esp_err_t voice_play_pcm_file(const char *path)
             break;
         }
 
-        ret = esp_codec_dev_write(s_spk_codec, s_beep, bytes_read);
+        ret = voice_write_pcm_bytes(s_beep, bytes_read);
         voice_output_unlock();
 
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "write pcm failed: %s", esp_err_to_name(ret));
             break;
         }
+
+        total_bytes += bytes_read;
 
         if (voice_try_cancel_from_mic()) {
             break;
@@ -530,7 +639,46 @@ static esp_err_t voice_play_pcm_file(const char *path)
         ESP_LOGI(TAG, "pcm playback stopped by request");
     }
 
+    ESP_LOGI(TAG, "pcm playback done: %s bytes=%u ret=%s",
+             path,
+             (unsigned)total_bytes,
+             esp_err_to_name(ret));
+
     return ret;
+}
+
+static int voice_alert_priority(int alert)
+{
+    switch ((helmet_voice_alert_t)alert) {
+    case HELMET_VOICE_ALERT_DANGER:
+        return 3;
+    case HELMET_VOICE_ALERT_FATIGUE:
+        return 2;
+    case HELMET_VOICE_ALERT_GNSS_LOST:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static uint32_t voice_alert_repeat_ms(helmet_voice_alert_t alert)
+{
+    switch (alert) {
+    case HELMET_VOICE_ALERT_DANGER:
+        return VOICE_DANGER_REPEAT_MS;
+
+    case HELMET_VOICE_ALERT_FATIGUE:
+        return VOICE_FATIGUE_REPEAT_MS;
+
+    case HELMET_VOICE_ALERT_GNSS_LOST:
+    default:
+        return VOICE_DEFAULT_REPEAT_MS;
+    }
+}
+
+static bool voice_alert_is_valid(helmet_voice_alert_t alert)
+{
+    return alert >= HELMET_VOICE_ALERT_FATIGUE && alert <= HELMET_VOICE_ALERT_GNSS_LOST;
 }
 
 static const char *voice_alert_pcm_path(helmet_voice_alert_t alert)
@@ -540,6 +688,8 @@ static const char *voice_alert_pcm_path(helmet_voice_alert_t alert)
         return VOICE_ACCIDENT_PCM_PATH;
 
     case HELMET_VOICE_ALERT_FATIGUE:
+        return VOICE_TIRED_PCM_PATH;
+
     case HELMET_VOICE_ALERT_GNSS_LOST:
     default:
         return NULL;
@@ -553,6 +703,7 @@ static esp_err_t voice_play_alert_now(helmet_voice_alert_t alert)
 
     s_voice_stop_requested = false;
     s_voice_output_busy = true;
+    s_current_alert = (int)alert;
     s_voice_runtime = VOICE_RUNTIME_PLAYING;
     helmet_state_set_voice(HELMET_VOICE_PLAYING);
     helmet_multinet_clean();
@@ -574,23 +725,84 @@ static esp_err_t voice_play_alert_now(helmet_voice_alert_t alert)
     s_voice_runtime = VOICE_RUNTIME_IDLE;
     s_voice_output_busy = false;
     s_voice_stop_requested = false;
+    s_current_alert = VOICE_ALERT_NONE;
+
+    if (ret == ESP_OK) {
+        s_last_alert_ms[(int)alert] = esp_log_timestamp();
+    }
 
     return ret;
 }
 
 static void voice_service_pending_alert(void)
 {
-    int pending = s_pending_alert;
+    if (!voice_output_lock(pdMS_TO_TICKS(50))) {
+        return;
+    }
 
-    if (pending == VOICE_ALERT_NONE || s_voice_output_busy) {
+    int pending = s_pending_alert;
+    if (pending == VOICE_ALERT_NONE || s_voice_output_busy || s_voice_streaming) {
+        voice_output_unlock();
         return;
     }
 
     s_pending_alert = VOICE_ALERT_NONE;
+    s_voice_output_busy = true;
+    voice_output_unlock();
 
     esp_err_t ret = voice_play_alert_now((helmet_voice_alert_t)pending);
 
     ESP_LOGI(TAG, "pending alert done ret=%s", esp_err_to_name(ret));
+}
+
+static void voice_alert_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "voice alert task started");
+
+    while (1) {
+        if (s_voice_alert_signal != NULL) {
+            xSemaphoreTake(s_voice_alert_signal, pdMS_TO_TICKS(250));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+
+        voice_service_pending_alert();
+    }
+}
+
+static esp_err_t start_voice_alert_task(void)
+{
+    if (s_voice_alert_task_handle != NULL) {
+        return ESP_OK;
+    }
+
+    if (s_voice_alert_signal == NULL) {
+        s_voice_alert_signal = xSemaphoreCreateBinary();
+        if (s_voice_alert_signal == NULL) {
+            ESP_LOGE(TAG, "create voice alert signal failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    BaseType_t task_ret = xTaskCreatePinnedToCore(
+        voice_alert_task,
+        "voice_alert",
+        VOICE_ALERT_TASK_STACK_SIZE,
+        NULL,
+        VOICE_ALERT_TASK_PRIORITY,
+        &s_voice_alert_task_handle,
+        VOICE_ALERT_TASK_CORE
+    );
+
+    if (task_ret != pdPASS) {
+        s_voice_alert_task_handle = NULL;
+        ESP_LOGE(TAG, "voice alert task: create failed");
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t helmet_voice_read_pcm(int16_t *mono_buffer, size_t frames, size_t *frames_read)
@@ -605,16 +817,12 @@ esp_err_t helmet_voice_read_pcm(int16_t *mono_buffer, size_t frames, size_t *fra
 
     size_t bytes_to_read = frames * sizeof(int16_t);
 
-    esp_err_t ret = esp_codec_dev_read(
-        s_mic_codec,
-        mono_buffer,
-        bytes_to_read
-    );
+    esp_err_t ret = esp_codec_dev_read(s_mic_codec, mono_buffer, (int)bytes_to_read);
 
-    if (ret != ESP_OK) {
+    if (ret != ESP_CODEC_DEV_OK) {
         *frames_read = 0;
         ESP_LOGE(TAG, "helmet_voice_read_pcm: read failed ret=%s", esp_err_to_name(ret));
-        return ret;
+        return (esp_err_t)ret;
     }
 
     *frames_read = frames;
@@ -633,8 +841,6 @@ static void voice_capture_task(void *arg)
     TickType_t last_cmd_tick = 0;
 
     while (1) {
-        voice_service_pending_alert();
-
         if (s_voice_output_busy) {
             vTaskDelay(pdMS_TO_TICKS(VOICE_CAPTURE_INTERVAL_MS));
             continue;
@@ -740,6 +946,38 @@ static esp_err_t start_voice_capture_task(void)
     return ESP_OK;
 }
 
+static void voice_sr_init_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "voice SR init task: start core=%d", VOICE_SR_INIT_TASK_CORE);
+
+    uint32_t start_ms = esp_log_timestamp();
+    esp_err_t ret = helmet_sr_init();
+    uint32_t elapsed_ms = esp_log_timestamp() - start_ms;
+
+    ESP_LOGI(TAG, "helmet_sr_init ret=%s elapsed=%" PRIu32 "ms",
+             esp_err_to_name(ret), elapsed_ms);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "helmet_voice_init: skip speaker test at boot");
+        ret = start_voice_capture_task();
+    }
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "voice SR init task failed: %s", esp_err_to_name(ret));
+        helmet_state_set_voice(HELMET_VOICE_ERROR);
+        s_voice_runtime = VOICE_RUNTIME_ERROR;
+    } else {
+        helmet_state_set_voice(HELMET_VOICE_READY);
+        s_voice_runtime = VOICE_RUNTIME_IDLE;
+        ESP_LOGI(TAG, "voice SR init task: done");
+    }
+
+    s_voice_sr_init_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
 esp_err_t helmet_voice_init(void)
 {
     ESP_LOGI(TAG, "helmet_voice_init: enter");
@@ -779,60 +1017,73 @@ esp_err_t helmet_voice_init(void)
         .bits_per_sample = HELMET_AUDIO_BITS,
     };
 
-    esp_err_t ret = esp_codec_dev_open(s_spk_codec, &fs);
-    ESP_LOGI(TAG, "speaker esp_codec_dev_open ret=%s", esp_err_to_name(ret));
-
-    if (ret != ESP_OK) {
+    int codec_ret = esp_codec_dev_open(s_spk_codec, &fs);
+    ESP_LOGI(TAG, "speaker esp_codec_dev_open ret=%s", esp_err_to_name(codec_ret));
+    if (codec_ret != ESP_CODEC_DEV_OK) {
         helmet_state_set_voice(HELMET_VOICE_ERROR);
-        return ret;
+        return (esp_err_t)codec_ret;
     }
 
-    ret = esp_codec_dev_open(s_mic_codec, &fs);
-    ESP_LOGI(TAG, "mic esp_codec_dev_open ret=%s", esp_err_to_name(ret));
-
-    if (ret != ESP_OK) {
+    codec_ret = esp_codec_dev_open(s_mic_codec, &fs);
+    ESP_LOGI(TAG, "mic esp_codec_dev_open ret=%s", esp_err_to_name(codec_ret));
+    if (codec_ret != ESP_CODEC_DEV_OK) {
         helmet_state_set_voice(HELMET_VOICE_ERROR);
-        return ret;
+        return (esp_err_t)codec_ret;
     }
 
-    ret = esp_codec_dev_set_out_vol(s_spk_codec, HELMET_AUDIO_VOLUME);
-    ESP_LOGI(TAG, "esp_codec_dev_set_out_vol ret=%s", esp_err_to_name(ret));
-
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "set speaker volume failed, continue");
-    }
-
-    ret = esp_codec_dev_set_in_gain(s_mic_codec, HELMET_MIC_GAIN);
-    ESP_LOGI(TAG, "esp_codec_dev_set_in_gain ret=%s", esp_err_to_name(ret));
-
-    if (ret != ESP_OK) {
+    codec_ret = esp_codec_dev_set_in_gain(s_mic_codec, HELMET_MIC_GAIN);
+    ESP_LOGI(TAG, "esp_codec_dev_set_in_gain ret=%s", esp_err_to_name(codec_ret));
+    if (codec_ret != ESP_CODEC_DEV_OK) {
         ESP_LOGW(TAG, "set mic gain failed, continue");
+    }
+
+    esp_err_t ret = voice_prepare_output();
+    ESP_LOGI(TAG, "voice_prepare_output ret=%s", esp_err_to_name(ret));
+
+    if (ret != ESP_OK) {
+        helmet_state_set_voice(HELMET_VOICE_ERROR);
+        return ret;
     }
 
     s_voice_inited = true;
     s_voice_runtime = VOICE_RUNTIME_IDLE;
     helmet_state_set_voice(HELMET_VOICE_READY);
 
-    ret = helmet_sr_init();
-    ESP_LOGI(TAG, "helmet_sr_init ret=%s", esp_err_to_name(ret));
-
+    ret = start_voice_alert_task();
     if (ret != ESP_OK) {
         helmet_state_set_voice(HELMET_VOICE_ERROR);
-        s_voice_inited = false;
         s_voice_runtime = VOICE_RUNTIME_ERROR;
         return ret;
     }
 
-    ESP_LOGI(TAG, "helmet_voice_init: skip speaker test at boot");
-
-    ret = start_voice_capture_task();
-
+    ret = test_speaker_once();
+    ESP_LOGI(TAG, "startup speaker self-test ret=%s", esp_err_to_name(ret));
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "helmet_voice_init: start voice capture task failed");
-        helmet_state_set_voice(HELMET_VOICE_ERROR);
-        s_voice_inited = false;
-        s_voice_runtime = VOICE_RUNTIME_ERROR;
-        return ret;
+        ESP_LOGW(TAG, "startup speaker self-test failed; alerts will still be queued");
+    }
+
+    if (s_voice_sr_init_task_handle == NULL && s_voice_capture_task_handle == NULL) {
+        BaseType_t task_ret = xTaskCreatePinnedToCore(
+            voice_sr_init_task,
+            "voice_sr_init",
+            VOICE_SR_INIT_TASK_STACK_SIZE,
+            NULL,
+            VOICE_SR_INIT_TASK_PRIORITY,
+            &s_voice_sr_init_task_handle,
+            VOICE_SR_INIT_TASK_CORE
+        );
+
+        if (task_ret != pdPASS) {
+            s_voice_sr_init_task_handle = NULL;
+            ESP_LOGE(TAG, "helmet_voice_init: create voice SR init task failed");
+            helmet_state_set_voice(HELMET_VOICE_ERROR);
+            s_voice_runtime = VOICE_RUNTIME_ERROR;
+            return ESP_FAIL;
+        }
+
+        ESP_LOGI(TAG, "helmet_voice_init: voice SR init deferred");
+    } else {
+        ESP_LOGI(TAG, "helmet_voice_init: voice SR/capture already active");
     }
 
     ESP_LOGI(TAG, "helmet_voice_init: done");
@@ -844,28 +1095,73 @@ esp_err_t helmet_voice_play_alert(helmet_voice_alert_t alert)
 {
     ESP_LOGI(TAG, "play alert: %d", alert);
 
-    if (!s_voice_inited || s_spk_codec == NULL) {
+    if (!s_voice_inited) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_voice_output_busy) {
-        ESP_LOGW(TAG, "voice output busy, skip alert");
-        return ESP_ERR_INVALID_STATE;
+    if (!voice_alert_is_valid(alert)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!voice_output_lock(pdMS_TO_TICKS(50))) {
+        ESP_LOGW(TAG, "voice output lock timeout, skip alert=%d", alert);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    bool output_busy = s_voice_output_busy || s_voice_streaming;
+    uint32_t now_ms = esp_log_timestamp();
+    uint32_t repeat_ms = voice_alert_repeat_ms(alert);
+
+    if (output_busy && s_current_alert == (int)alert) {
+        ESP_LOGI(TAG, "alert=%d already playing, skip duplicate", alert);
+        voice_output_unlock();
+        return ESP_OK;
+    }
+
+    if (!output_busy && s_pending_alert != (int)alert && s_last_alert_ms[(int)alert] != 0) {
+        uint32_t elapsed_ms = now_ms - s_last_alert_ms[(int)alert];
+        if (elapsed_ms < repeat_ms) {
+            ESP_LOGI(TAG, "alert=%d cooldown %u/%u ms, skip duplicate",
+                     alert,
+                     (unsigned)elapsed_ms,
+                     (unsigned)repeat_ms);
+            voice_output_unlock();
+            return ESP_OK;
+        }
     }
 
     if (s_pending_alert != VOICE_ALERT_NONE) {
-        ESP_LOGW(TAG, "voice alert already pending, skip alert=%d", alert);
-        return ESP_ERR_INVALID_STATE;
+        if (voice_alert_priority((int)alert) > voice_alert_priority(s_pending_alert)) {
+            ESP_LOGW(TAG, "replace pending alert %d with %d", s_pending_alert, alert);
+            s_pending_alert = (int)alert;
+        } else {
+            ESP_LOGW(TAG, "voice alert already pending=%d, skip alert=%d", s_pending_alert, alert);
+            voice_output_unlock();
+            return s_pending_alert == (int)alert ? ESP_OK : ESP_ERR_INVALID_STATE;
+        }
+    } else {
+        if (output_busy) {
+            s_pending_alert = (int)alert;
+        }
     }
 
-    s_pending_alert = (int)alert;
+    voice_output_unlock();
+
+    if (!output_busy) {
+        return voice_play_alert_now(alert);
+    }
+
+    if (s_voice_alert_signal != NULL) {
+        xSemaphoreGive(s_voice_alert_signal);
+    }
+    ESP_LOGI(TAG, "voice output busy, queued alert=%d", alert);
 
     return ESP_OK;
 }
 
 esp_err_t helmet_voice_stream_pcm_begin(void)
 {
-    if (!s_voice_inited || s_spk_codec == NULL) {
+    if (!s_voice_inited) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -885,6 +1181,17 @@ esp_err_t helmet_voice_stream_pcm_begin(void)
     s_voice_runtime = VOICE_RUNTIME_PLAYING;
     helmet_state_set_voice(HELMET_VOICE_PLAYING);
 
+    esp_err_t ret = voice_prepare_output();
+    if (ret != ESP_OK) {
+        s_voice_streaming = false;
+        s_voice_output_busy = false;
+        s_voice_runtime = VOICE_RUNTIME_ERROR;
+        helmet_state_set_voice(HELMET_VOICE_ERROR);
+        voice_output_unlock();
+        ESP_LOGE(TAG, "prepare pcm stream failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
     voice_output_unlock();
 
     ESP_LOGI(TAG, "pcm stream begin");
@@ -894,7 +1201,7 @@ esp_err_t helmet_voice_stream_pcm_begin(void)
 
 esp_err_t helmet_voice_stream_pcm_write(const void *pcm, size_t bytes)
 {
-    if (!s_voice_inited || s_spk_codec == NULL) {
+    if (!s_voice_inited) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -918,7 +1225,7 @@ esp_err_t helmet_voice_stream_pcm_write(const void *pcm, size_t bytes)
         return ESP_ERR_TIMEOUT;
     }
 
-    esp_err_t ret = esp_codec_dev_write(s_spk_codec, (void *)pcm, bytes);
+    esp_err_t ret = voice_write_pcm_bytes(pcm, bytes);
     voice_output_unlock();
 
     return ret;

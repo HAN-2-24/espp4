@@ -26,6 +26,17 @@ __pycache__/
 # Logs
 *.log
 
+# Local model training outputs
+.codex_tmp/
+data/
+runs/
+components/helmet_drivers/models/esp32p4/*.info
+components/helmet_drivers/models/esp32p4/*.json
+components/helmet_drivers/models/esp32p4/*.work.onnx
+components/helmet_drivers/models/esp32p4/archive/
+yolov8n.pt
+helmet_camera_view.bmp
+
 # Local secrets
 cloud/bridge_secrets.json
 

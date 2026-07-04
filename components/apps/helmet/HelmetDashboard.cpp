@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 
+#include "esp_err.h"
 #include "esp_log.h"
 
 #include "helmet_board.h"
@@ -10,6 +11,7 @@
 #include "helmet_imu.h"
 #include "helmet_voice.h"
 #include "helmet_vision.h"
+#include "helmet_camera_usb.h"
 #include "helmet_cloud.h"
 #include "ui/ui_helmet.h"
 
@@ -39,6 +41,11 @@ bool HelmetDashboard::init(void)
     helmet_imu_init();
     helmet_voice_init();
     helmet_vision_init();
+    helmet_vision_start();
+    esp_err_t cam_usb_ret = helmet_camera_usb_init();
+    if (cam_usb_ret != ESP_OK) {
+        ESP_LOGW(TAG, "camera USB debug unavailable: %s", esp_err_to_name(cam_usb_ret));
+    }
    
     helmet_cloud_init();
 

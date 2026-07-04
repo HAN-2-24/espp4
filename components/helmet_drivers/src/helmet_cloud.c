@@ -7,6 +7,10 @@
 #include <string.h>
 
 #include "sdkconfig.h"
+#if defined(CONFIG_ESP_HOSTED_CP_TARGET_ESP32H2) && !defined(CONFIG_SLAVE_IDF_TARGET_ESP32H2)
+#define CONFIG_SLAVE_IDF_TARGET_ESP32H2 1
+#endif
+#include "esp_wifi_default_config.h"
 #include "esp_event.h"
 #include "esp_err.h"
 #include "esp_log.h"
